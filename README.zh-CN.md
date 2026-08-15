@@ -140,6 +140,10 @@ python3 -m platformio run -e m5stack-stopwatch --target upload
 
 在Vibe Watch上打开Settings，选择三个设备槽位之一，点击**PAIR**，然后从macOS蓝牙设置连接到`Vibe Watch #n`。
 
+## 常见问题与经验教训
+
+- [开发与烧录经验教训 (Lessons Learned)](docs/lessons-learned.md)：包含烧录黑屏/绿灯闪烁排查、ESP32-S3 分区表机制、中英双语字体适配及 NVS 配置保存等核心经验。
+
 ## 许可证
 
 [MIT License](LICENSE)

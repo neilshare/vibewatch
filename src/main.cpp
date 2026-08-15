@@ -53,6 +53,12 @@ constexpr char kDeviceSlotKey[] = "device-slot";
 constexpr char kSeVolumeKey[] = "se-volume";
 constexpr char kVibrationStrengthKey[] = "vibe-strength";
 constexpr char kAgentStateVibeKey[] = "state-vibe";
+constexpr char kLanguageKey[] = "language";
+
+enum Language : std::uint8_t {
+    LANG_ZH = 0,
+    LANG_EN = 1,
+};
 
 // Hit-test results share one integer space. Non-negative values below
 // kAgentCount are outer-ring items; the remaining values identify fixed UI
@@ -67,6 +73,7 @@ constexpr int kTouchPair = kAgentCount + 6;
 constexpr int kTouchVolume = kAgentCount + 7;
 constexpr int kTouchVibrationStrength = kAgentCount + 8;
 constexpr int kTouchAgentStateVibe = kAgentCount + 9;
+constexpr int kTouchLanguage = kAgentCount + 10;
 
 struct AgentState {
     std::uint32_t color = 0;
@@ -106,9 +113,96 @@ volatile bool g_uiDirty = true;
 volatile bool g_pairingSuccessPending = false;
 String g_rxBuffer;
 
+constexpr char kQuotaServiceUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c01";
+constexpr char kQuotaWriteUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c02";
+
+struct QuotaState {
+    float remainingPercent = 0.0f;
+    std::uint32_t resetInSeconds = 0;
+    std::uint32_t receivedAtMs = 0;
+    bool available = false;
+};
+QuotaState g_quota;
+constexpr std::uint32_t kQuotaStaleAfterMs = 180000;
+
+void formatResetCountdown(std::uint32_t seconds, char* buffer, std::size_t len) {
+    if (seconds == 0) {
+        std::snprintf(buffer, len, "RESET --");
+        return;
+    }
+    const unsigned days = seconds / 86400;
+    const unsigned hours = (seconds % 86400) / 3600;
+    const unsigned mins = (seconds % 3600) / 60;
+    if (days > 0) {
+        std::snprintf(buffer, len, "RESET %uD %02uH", days, hours);
+    } else if (hours > 0) {
+        std::snprintf(buffer, len, "RESET %uH %02uM", hours, mins);
+    } else {
+        std::snprintf(buffer, len, "RESET %uM", mins);
+    }
+}
+
+void applyQuotaStatus(JsonVariantConst params) {
+    if (params.isNull()) return;
+    float remaining = -1.0f;
+    std::uint32_t resetSec = 0;
+    if (params.is<JsonObjectConst>()) {
+        JsonObjectConst obj = params.as<JsonObjectConst>();
+        remaining = obj["remaining_percent"] | obj["remainingPercent"] | -1.0f;
+        resetSec = obj["reset_in_seconds"] | obj["resetInSeconds"] | 0U;
+    }
+    if (remaining >= 0.0f && remaining <= 100.0f) {
+        g_quota.remainingPercent = remaining;
+        g_quota.resetInSeconds = resetSec;
+        g_quota.receivedAtMs = millis();
+        g_quota.available = true;
+        g_uiDirty = true;
+        Serial.printf("Quota update received: %.1f%% resetIn=%us\n", remaining, resetSec);
+    }
+}
+
+class QuotaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
+        const NimBLEAttValue value = characteristic->getValue();
+        const auto* data = value.data();
+        const std::size_t length = value.size();
+        if (data == nullptr || length == 0) return;
+
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, data, length);
+        if (!err) {
+            applyQuotaStatus(doc.as<JsonVariantConst>());
+        } else {
+            Serial.printf("Quota JSON parse failed: %s\n", err.c_str());
+        }
+    }
+};
+QuotaCharacteristicCallbacks g_quotaCallbacks;
+
 // Input state is intentionally explicit because a physical-button press may
 // become a single action, a long press, or a two-button layer-switch chord.
 int g_activeTouch = -1;
+int g_touchStartX = -1;
+int g_touchStartY = -1;
+int g_activeSwipe = -1;
+constexpr int kSwipeThresholdPx = 45;
+
+std::uint32_t g_lastActivityAt = 0;
+bool g_isDimmed = false;
+bool g_isScreenSleeping = false;
+constexpr std::uint32_t kDimTimeoutMs = 60000;
+constexpr std::uint32_t kSleepTimeoutMs = 180000;
+
+void noteActivity() {
+    g_lastActivityAt = millis();
+    if (g_isScreenSleeping || g_isDimmed) {
+        g_isScreenSleeping = false;
+        g_isDimmed = false;
+        M5.Display.setBrightness(80);
+        g_uiDirty = true;
+    }
+}
+
 std::uint32_t g_vibrationOffAt = 0;
 std::uint32_t g_lastUiDraw = 0;
 std::uint32_t g_lastBatteryUpdate = 0;
@@ -148,6 +242,7 @@ char g_deviceName[24] = {};
 std::uint8_t g_seVolume = 128;
 std::uint8_t g_vibrationStrength = 255;
 bool g_agentStateVibeEnabled = true;
+Language g_language = LANG_ZH;
 std::uint32_t g_lastAgentVibrationAt = 0;
 
 std::array<int, kAgentCount> agentX{};
@@ -166,12 +261,24 @@ void loadPreferences() {
     g_seVolume = preferences.getUChar(kSeVolumeKey, 128);
     g_vibrationStrength = preferences.getUChar(kVibrationStrengthKey, 255);
     g_agentStateVibeEnabled = preferences.getBool(kAgentStateVibeKey, true);
+    g_language = static_cast<Language>(
+        preferences.getUChar(kLanguageKey, static_cast<std::uint8_t>(LANG_ZH)));
     preferences.end();
     if (g_deviceSlot < 1 || g_deviceSlot > 3) {
         g_deviceSlot = 1;
     }
+    if (g_language > LANG_EN) {
+        g_language = LANG_ZH;
+    }
     g_pendingDeviceSlot = g_deviceSlot;
     std::snprintf(g_deviceName, sizeof(g_deviceName), "%s%d", vibe::kDeviceNamePrefix, g_deviceSlot);
+}
+
+void saveLanguage() {
+    Preferences preferences;
+    preferences.begin(kPreferencesNamespace, false);
+    preferences.putUChar(kLanguageKey, static_cast<std::uint8_t>(g_language));
+    preferences.end();
 }
 
 void saveDeviceSlot(int slot) {
@@ -347,8 +454,27 @@ void sendMicEvent(bool pressed) {
     sendActionEvent(11, pressed);
 }
 
+void sendJoystickEvent(float angle, float distance) {
+    if (!g_connected || g_vendorInput == nullptr) {
+        return;
+    }
+    std::uint8_t report[vibe::kBleReportLength] = {};
+    report[0] = vibe::kChannelJsonRpc;
+    const int written = std::snprintf(
+        reinterpret_cast<char*>(&report[2]), vibe::kRpcChunkLength,
+        "{\"m\":\"v.oai.rad\",\"p\":{\"a\":%.2f,\"d\":%.2f}}\r\n", angle, distance);
+    if (written < 0 || written >= static_cast<int>(vibe::kRpcChunkLength)) {
+        return;
+    }
+    report[1] = static_cast<std::uint8_t>(written);
+    g_vendorInput->setValue(report, sizeof(report));
+    g_vendorInput->notify();
+    Serial.printf("JOYSTICK angle=%.2f dist=%.2f\n", angle, distance);
+}
+
 // Apply the host's compact agent-state array directly to the six ring buttons.
 void applyAgentStatus(JsonVariantConst params) {
+    noteActivity();
     if (!params.is<JsonArrayConst>()) {
         return;
     }
@@ -450,6 +576,8 @@ void processRpc(const char* json) {
         applyAmbientStatus(params);
     } else if (std::strcmp(method, "host.focused_app") == 0) {
         applyFocusedApp(params);
+    } else if (std::strcmp(method, "v.oai.quota") == 0 || std::strcmp(method, "quota") == 0) {
+        applyQuotaStatus(params);
     }
 
     if (id >= 0 && method[0] != '\0') {
@@ -590,6 +718,14 @@ void initializeBle() {
     g_vendorOutput->setCallbacks(&g_rpcCallbacks);
 
     updateBattery(false);
+
+    auto* quotaService = g_server->createService(kQuotaServiceUuid);
+    auto* quotaCharacteristic = quotaService->createCharacteristic(
+        kQuotaWriteUuid,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+    quotaCharacteristic->setCallbacks(&g_quotaCallbacks);
+
     if (!g_server->start()) {
         Serial.println("Failed to start BLE GATT server");
         return;
@@ -599,6 +735,7 @@ void initializeBle() {
     advertising->setName(g_deviceName);
     advertising->setAppearance(HID_KEYBOARD);
     advertising->addServiceUUID(g_hid->getHidService()->getUUID());
+    advertising->addServiceUUID(kQuotaServiceUuid);
     advertising->enableScanResponse(true);
     advertising->start();
     Serial.printf("BLE HID advertising started as %s\n", g_deviceName);
@@ -740,8 +877,11 @@ int hitTestSettings(int x, int y) {
     if (pointInRect(x, y, 80, 267, 306, 55)) {
         return kTouchVibrationStrength;
     }
-    if (pointInRect(x, y, 145, 352, 180, 55)) {
+    if (pointInRect(x, y, 95, 355, 120, 50)) {
         return kTouchAgentStateVibe;
+    }
+    if (pointInRect(x, y, 226, 355, 148, 50)) {
+        return kTouchLanguage;
     }
     return -1;
 }
@@ -833,6 +973,11 @@ void handleSettingsTouch(const m5::Touch_Class::touch_detail_t& touch) {
             saveFeedbackSettings();
             playSe(g_agentStateVibeEnabled ? 1040.0f : 620.0f, 45);
             vibrate(130, 28);
+        } else if (g_activeTouch == kTouchLanguage) {
+            g_language = (g_language == LANG_ZH) ? LANG_EN : LANG_ZH;
+            saveLanguage();
+            playSe(880.0f, 40);
+            vibrate(100, 25);
         }
         g_uiDirty = true;
     }
@@ -860,12 +1005,19 @@ void handleSettingsTouch(const m5::Touch_Class::touch_detail_t& touch) {
 
 void handleTouch() {
     const auto touch = M5.Touch.getDetail();
+    if (touch.wasPressed() || touch.isPressed() || touch.wasReleased()) {
+        noteActivity();
+    }
+
     if (g_settingsOpen) {
         handleSettingsTouch(touch);
         return;
     }
 
     if (touch.wasPressed()) {
+        g_touchStartX = touch.x;
+        g_touchStartY = touch.y;
+        g_activeSwipe = -1;
         g_activeTouch = hitTestMain(touch.x, touch.y);
         // Remember the layer from touch-down through touch-up. A layer change
         // during the gesture must not release a different host-side control.
@@ -896,23 +1048,75 @@ void handleTouch() {
         g_uiDirty = true;
     }
 
-    if (touch.wasReleased() && g_activeTouch >= 0) {
-        if (g_activeTouch < kAgentCount) {
-            if (g_touchActionLayer) {
-                sendOuterActionEvent(g_activeTouch, false);
+    if (touch.isPressed() && g_activeSwipe < 0 && g_touchStartX >= 0) {
+        const int dx = touch.x - g_touchStartX;
+        const int dy = touch.y - g_touchStartY;
+        if (dx * dx + dy * dy >= kSwipeThresholdPx * kSwipeThresholdPx) {
+            float angle = 0.0f;
+            if (std::abs(dx) >= std::abs(dy)) {
+                g_activeSwipe = dx > 0 ? 1 : 3; // RIGHT or LEFT
+                angle = dx > 0 ? 0.00f : 0.50f;
             } else {
-                sendAgentEvent(g_activeTouch, false);
+                g_activeSwipe = dy > 0 ? 2 : 0; // DOWN or UP
+                angle = dy > 0 ? 0.25f : 0.75f;
             }
-        } else if (g_activeTouch == kTouchMic) {
-            sendMicEvent(false);
-            playMicSe(false);
+            // Cancel any button press that was initiated before swipe
+            if (g_activeTouch == kTouchMic) {
+                sendMicEvent(false);
+                playMicSe(false);
+            } else if (g_activeTouch >= 0 && g_activeTouch < kAgentCount) {
+                if (g_touchActionLayer) {
+                    sendOuterActionEvent(g_activeTouch, false);
+                } else {
+                    sendAgentEvent(g_activeTouch, false);
+                }
+            }
+            g_activeTouch = -1;
+            sendJoystickEvent(angle, 1.0f);
+            vibrate(180, 40);
+            playSe(980.0f, 30);
+            g_uiDirty = true;
         }
-        g_activeTouch = -1;
-        g_uiDirty = true;
+    }
+
+    if (touch.wasReleased()) {
+        if (g_activeSwipe >= 0) {
+            float angle = 0.0f;
+            if (g_activeSwipe == 1) angle = 0.00f; // Right
+            else if (g_activeSwipe == 2) angle = 0.25f; // Down
+            else if (g_activeSwipe == 3) angle = 0.50f; // Left
+            else if (g_activeSwipe == 0) angle = 0.75f; // Up
+            sendJoystickEvent(angle, 0.0f);
+            g_activeSwipe = -1;
+            g_activeTouch = -1;
+            g_touchStartX = -1;
+            g_touchStartY = -1;
+            g_uiDirty = true;
+            return;
+        }
+        g_touchStartX = -1;
+        g_touchStartY = -1;
+        if (g_activeTouch >= 0) {
+            if (g_activeTouch < kAgentCount) {
+                if (g_touchActionLayer) {
+                    sendOuterActionEvent(g_activeTouch, false);
+                } else {
+                    sendAgentEvent(g_activeTouch, false);
+                }
+            } else if (g_activeTouch == kTouchMic) {
+                sendMicEvent(false);
+                playMicSe(false);
+            }
+            g_activeTouch = -1;
+            g_uiDirty = true;
+        }
     }
 }
 
 void handlePhysicalButtons() {
+    if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnA.isPressed() || M5.BtnB.isPressed()) {
+        noteActivity();
+    }
     // Treat the two physical buttons as a chord before dispatching either
     // single-button action. The short grace period prevents an Agent/OK/NG
     // event from leaking out when the user's intention is to switch layers.
@@ -1270,13 +1474,20 @@ void drawStatusBar() {
 
     char status[40];
     if (g_restartAt != 0) {
-        std::snprintf(status, sizeof(status), "RESTART  #%d", g_deviceSlot);
+        std::snprintf(status, sizeof(status), g_language == LANG_ZH ? "重启  #%d" : "RESTART  #%d", g_deviceSlot);
     } else {
-        std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", g_connected ? "ON" : "PAIR",
+        const char* stateText = g_connected ? (g_language == LANG_ZH ? "在线" : "ON")
+                                            : (g_language == LANG_ZH ? "配对" : "PAIR");
+        std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", stateText,
                       g_deviceSlot, g_batteryLevel, g_isCharging ? "+" : "");
     }
-    M5.Display.setFont(&fonts::Orbitron_Light_24);
-    M5.Display.setTextSize(0.75f);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.75f);
+    }
     M5.Display.setTextColor(TFT_WHITE, panel);
     M5.Display.drawString(status, kScreenCenter, 439);
 }
@@ -1288,14 +1499,47 @@ void renderSettingsUi() {
     const auto muted = M5.Display.color565(205, 210, 222);
 
     M5.Display.setTextDatum(middle_center);
-    M5.Display.setFont(&fonts::Orbitron_Light_32);
-    M5.Display.setTextSize(0.82f);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.drawString("SETTINGS", 218, 38);
-    M5.Display.setFont(&fonts::DejaVu18);
-    M5.Display.setTextSize(0.78f);
-    M5.Display.setTextColor(muted, TFT_BLACK);
-    M5.Display.drawString("BLUETOOTH DEVICE", kScreenCenter, 72);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_24);
+        M5.Display.setTextSize(1.0f);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.drawString("系统设置", 218, 38);
+
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+        M5.Display.setTextColor(muted, TFT_BLACK);
+        if (g_quota.available) {
+            char resetStr[24];
+            const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+            char quotaLine[48];
+            std::snprintf(quotaLine, sizeof(quotaLine), "QUOTA: %.0f%% (%s)", g_quota.remainingPercent, resetStr);
+            M5.Display.drawString(quotaLine, kScreenCenter, 72);
+        } else {
+            M5.Display.drawString("蓝牙设备槽位", kScreenCenter, 72);
+        }
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_32);
+        M5.Display.setTextSize(0.82f);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.drawString("SETTINGS", 218, 38);
+
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(0.78f);
+        M5.Display.setTextColor(muted, TFT_BLACK);
+        if (g_quota.available) {
+            char resetStr[24];
+            const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+            char quotaLine[48];
+            std::snprintf(quotaLine, sizeof(quotaLine), "QUOTA: %.0f%% (%s)", g_quota.remainingPercent, resetStr);
+            M5.Display.drawString(quotaLine, kScreenCenter, 72);
+        } else {
+            M5.Display.drawString("BLUETOOTH DEVICE", kScreenCenter, 72);
+        }
+    }
 
     M5.Display.fillCircle(kSettingsCloseX, kSettingsCloseY, kSettingsCloseRadius, panel);
     drawThickCircle(kSettingsCloseX, kSettingsCloseY, kSettingsCloseRadius, 3, panelBorder);
@@ -1324,14 +1568,29 @@ void renderSettingsUi() {
     drawThickRoundRect(153, 151, 160, 45, 22, pairPressed ? 5 : 3,
                        pairPressed ? TFT_WHITE : panelBorder);
     M5.Display.setTextColor(TFT_WHITE, pairFill);
-    M5.Display.drawString("PAIR", kScreenCenter, 173);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.1f);
+        M5.Display.drawString("开始配对", kScreenCenter, 173);
+    } else {
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(1.0f);
+        M5.Display.drawString("PAIR", kScreenCenter, 173);
+    }
 
-    M5.Display.setFont(&fonts::DejaVu18);
-    M5.Display.setTextSize(0.82f);
+    char volumeLabel[32];
+    if (g_language == LANG_ZH) {
+        std::snprintf(volumeLabel, sizeof(volumeLabel), "按键音量  %u%%",
+                      static_cast<unsigned>(g_seVolume) * 100 / 255);
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+    } else {
+        std::snprintf(volumeLabel, sizeof(volumeLabel), "SE VOLUME  %u%%",
+                      static_cast<unsigned>(g_seVolume) * 100 / 255);
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(0.82f);
+    }
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    char volumeLabel[24];
-    std::snprintf(volumeLabel, sizeof(volumeLabel), "SE VOLUME  %u%%",
-                  static_cast<unsigned>(g_seVolume) * 100 / 255);
     M5.Display.drawString(volumeLabel, kScreenCenter, 216);
 
     const int volumeX = kSettingsSliderLeft + static_cast<int>(g_seVolume) *
@@ -1345,8 +1604,18 @@ void renderSettingsUi() {
     drawThickCircle(volumeX, 242, 12, 2, purple);
 
     char vibrationLabel[32];
-    std::snprintf(vibrationLabel, sizeof(vibrationLabel), "VIBE STRENGTH  %u%%",
-                  static_cast<unsigned>(g_vibrationStrength) * 100 / 255);
+    if (g_language == LANG_ZH) {
+        std::snprintf(vibrationLabel, sizeof(vibrationLabel), "震动强度  %u%%",
+                      static_cast<unsigned>(g_vibrationStrength) * 100 / 255);
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+    } else {
+        std::snprintf(vibrationLabel, sizeof(vibrationLabel), "VIBE STRENGTH  %u%%",
+                      static_cast<unsigned>(g_vibrationStrength) * 100 / 255);
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(0.82f);
+    }
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.drawString(vibrationLabel, kScreenCenter, 278);
 
     const int vibrationX = kSettingsSliderLeft + static_cast<int>(g_vibrationStrength) *
@@ -1359,9 +1628,17 @@ void renderSettingsUi() {
     M5.Display.fillCircle(vibrationX, 304, 12, TFT_WHITE);
     drawThickCircle(vibrationX, 304, 12, 2, purple);
 
-    M5.Display.setTextSize(0.72f);
-    M5.Display.setTextColor(muted, TFT_BLACK);
-    M5.Display.drawString("AGENT 1-6 STATE CHANGE", kScreenCenter, 341);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(0.95f);
+        M5.Display.setTextColor(muted, TFT_BLACK);
+        M5.Display.drawString("智能体状态变化提醒", kScreenCenter, 341);
+    } else {
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(0.72f);
+        M5.Display.setTextColor(muted, TFT_BLACK);
+        M5.Display.drawString("AGENT 1-6 STATE CHANGE", kScreenCenter, 341);
+    }
 
     const auto drawCheckbox = [&](int x, const char* label, bool checked) {
         const auto fill = checked ? purple : panel;
@@ -1373,10 +1650,40 @@ void renderSettingsUi() {
         }
         M5.Display.setTextDatum(middle_left);
         M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        M5.Display.drawString(label, x + 38, 381);
+        if (g_language == LANG_ZH) {
+            M5.Display.setFont(&fonts::efontCN_16);
+            M5.Display.setTextSize(1.0f);
+        } else {
+            M5.Display.setFont(&fonts::DejaVu18);
+            M5.Display.setTextSize(0.78f);
+        }
+        M5.Display.drawString(label, x + 36, 381);
         M5.Display.setTextDatum(middle_center);
     };
-    drawCheckbox(178, "VIBE", g_agentStateVibeEnabled);
+    drawCheckbox(105, g_language == LANG_ZH ? "震动" : "VIBE", g_agentStateVibeEnabled);
+
+    // Language toggle switch on the right side
+    constexpr int kLangSwitchX = 236;
+    constexpr int kLangSwitchY = 367;
+    constexpr int kLangSwitchW = 128;
+    constexpr int kLangSwitchH = 28;
+    M5.Display.fillRoundRect(kLangSwitchX, kLangSwitchY, kLangSwitchW, kLangSwitchH, 6, panel);
+    drawThickRoundRect(kLangSwitchX, kLangSwitchY, kLangSwitchW, kLangSwitchH, 6, 2, panelBorder);
+
+    const int pillX = (g_language == LANG_ZH) ? kLangSwitchX + 2 : kLangSwitchX + kLangSwitchW / 2;
+    M5.Display.fillRoundRect(pillX, kLangSwitchY + 2, kLangSwitchW / 2 - 2, kLangSwitchH - 4, 4, purple);
+
+    M5.Display.setFont(&fonts::efontCN_16);
+    M5.Display.setTextSize(0.9f);
+    M5.Display.setTextColor(g_language == LANG_ZH ? TFT_WHITE : muted,
+                            (g_language == LANG_ZH) ? purple : panel);
+    M5.Display.drawString("中文", kLangSwitchX + kLangSwitchW / 4, kLangSwitchY + kLangSwitchH / 2);
+
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextSize(0.75f);
+    M5.Display.setTextColor(g_language == LANG_EN ? TFT_WHITE : muted,
+                            (g_language == LANG_EN) ? purple : panel);
+    M5.Display.drawString("EN", kLangSwitchX + 3 * kLangSwitchW / 4, kLangSwitchY + kLangSwitchH / 2);
 
     drawStatusBar();
 }
@@ -1463,14 +1770,25 @@ void renderUi(std::uint32_t now) {
             } else {
                 drawAssistantGlyph(outerX, glyphY, TFT_WHITE);
             }
-            static constexpr const char* kOuterActionLabels[kActionCount] = {
+            static constexpr const char* kOuterActionLabelsEn[kActionCount] = {
                 "FAST", "OK", "NG", "PLAN", "AI",
             };
-            M5.Display.setFont(&fonts::Orbitron_Light_24);
-            M5.Display.setTextSize(0.62f);
-            M5.Display.setTextColor(TFT_WHITE);
-            M5.Display.drawString(kOuterActionLabels[i], outerX,
-                                  outerY + kAgentButtonRadius + 13);
+            static constexpr const char* kOuterActionLabelsZh[kActionCount] = {
+                "快速", "确认", "拒绝", "计划", "AI",
+            };
+            if (g_language == LANG_ZH) {
+                M5.Display.setFont(&fonts::efontCN_16);
+                M5.Display.setTextSize(1.0f);
+                M5.Display.setTextColor(TFT_WHITE);
+                M5.Display.drawString(kOuterActionLabelsZh[i], outerX,
+                                      outerY + kAgentButtonRadius + 13);
+            } else {
+                M5.Display.setFont(&fonts::Orbitron_Light_24);
+                M5.Display.setTextSize(0.62f);
+                M5.Display.setTextColor(TFT_WHITE);
+                M5.Display.drawString(kOuterActionLabelsEn[i], outerX,
+                                      outerY + kAgentButtonRadius + 13);
+            }
             M5.Display.setFont(&fonts::Orbitron_Light_32);
             M5.Display.setTextSize(1);
         } else {
@@ -1494,13 +1812,67 @@ void renderUi(std::uint32_t now) {
         drawSelectionIndicator(now);
     }
 
+    // Draw Quota orbital gauge ring if available
+    const bool quotaStale = g_quota.available && (now - g_quota.receivedAtMs > kQuotaStaleAfterMs);
+    if (g_quota.available && !g_actionLayer) {
+        constexpr int kQuotaOuterR = 82;
+        constexpr int kQuotaInnerR = 76;
+        const auto trackColor = M5.Display.color565(38, 50, 61);
+        M5.Display.fillArc(kScreenCenter, kScreenCenter, kQuotaOuterR, kQuotaInnerR, 0, 360, trackColor);
+
+        const float remaining = std::max(0.0f, std::min(100.0f, g_quota.remainingPercent));
+        const auto quotaColor = quotaStale
+            ? M5.Display.color565(116, 85, 39)
+            : (remaining > 20.0f ? M5.Display.color565(18, 214, 178) : M5.Display.color565(255, 180, 74));
+
+        M5.Display.fillArc(kScreenCenter, kScreenCenter, kQuotaOuterR, kQuotaInnerR, 0,
+                           static_cast<int>(remaining * 3.6f), quotaColor);
+
+        // 4 Calibration tick marks
+        M5.Display.fillRoundRect(kScreenCenter - 1, kScreenCenter - kQuotaOuterR, 3, 7, 1, TFT_BLACK);
+        M5.Display.fillRoundRect(kScreenCenter + kQuotaInnerR - 1, kScreenCenter - 1, 7, 3, 1, TFT_BLACK);
+        M5.Display.fillRoundRect(kScreenCenter - 1, kScreenCenter + kQuotaInnerR - 1, 3, 7, 1, TFT_BLACK);
+        M5.Display.fillRoundRect(kScreenCenter - kQuotaOuterR, kScreenCenter - 1, 7, 3, 1, TFT_BLACK);
+    }
+
     const bool micPressed = g_rightLongTriggered || g_activeTouch == kTouchMic;
     const auto micAccent = M5.Display.color565(48, 79, 254);
     const auto micFill = micPressed ? micAccent : M5.Display.color565(25, 31, 40);
     M5.Display.fillCircle(kScreenCenter, kScreenCenter, kMicButtonRadius, micFill);
     drawThickCircle(kScreenCenter, kScreenCenter, kMicButtonRadius, micPressed ? 7 : 4,
                     micPressed ? TFT_WHITE : micAccent);
-    drawLargeMicGlyph(kScreenCenter, kScreenCenter - 2, TFT_WHITE);
+
+    if (g_quota.available && !micPressed && !g_actionLayer) {
+        const auto textColor = quotaStale ? M5.Display.color565(180, 150, 100) : M5.Display.color565(18, 214, 178);
+        const auto mutedColor = M5.Display.color565(130, 142, 160);
+
+        // Top line: Pure technical label "WEEKLY"
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.48f);
+        M5.Display.setTextColor(mutedColor, micFill);
+        M5.Display.drawString(quotaStale ? "SYNC STALE" : "WEEKLY", kScreenCenter, kScreenCenter - 34);
+
+        // Center line: Crisp percentage "59%"
+        char quotaText[16];
+        std::snprintf(quotaText, sizeof(quotaText), "%.0f%%", g_quota.remainingPercent);
+        M5.Display.setFont(&fonts::Orbitron_Light_32);
+        M5.Display.setTextSize(0.85f);
+        M5.Display.setTextColor(textColor, micFill);
+        M5.Display.drawString(quotaText, kScreenCenter, kScreenCenter - 1);
+
+        // Bottom line: Minimal concise countdown e.g. "RESET 1H 00M"
+        char resetStr[24];
+        const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
+        const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+        formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.46f);
+        M5.Display.setTextColor(quotaStale ? mutedColor : TFT_WHITE, micFill);
+        M5.Display.drawString(resetStr, kScreenCenter, kScreenCenter + 32);
+    } else {
+        drawLargeMicGlyph(kScreenCenter, kScreenCenter - 2, TFT_WHITE);
+    }
 
     if (!g_actionLayer) {
         const auto settingsFill = M5.Display.color565(30, 32, 40);
@@ -1560,11 +1932,19 @@ void drawSplashFrame(float progress) {
     M5.Display.setTextColor(purple, TFT_BLACK);
     M5.Display.drawString("VIBEWATCH", kScreenCenter, 202);
 
-    M5.Display.setFont(&fonts::Orbitron_Light_24);
-    M5.Display.setTextSize(0.62f);
-    M5.Display.setTextColor(cyan, TFT_BLACK);
-    M5.Display.drawString("AI CONTROL SURFACE", kScreenCenter, 252);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.1f);
+        M5.Display.setTextColor(cyan, TFT_BLACK);
+        M5.Display.drawString("AI 交互控制器", kScreenCenter, 252);
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.62f);
+        M5.Display.setTextColor(cyan, TFT_BLACK);
+        M5.Display.drawString("AI CONTROL SURFACE", kScreenCenter, 252);
+    }
 
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
     M5.Display.setTextSize(0.68f);
     M5.Display.setTextColor(muted, TFT_BLACK);
     M5.Display.drawString(vibe::kFirmwareVersion, kScreenCenter, 291);
@@ -1585,8 +1965,15 @@ void drawSplashFrame(float progress) {
     const int batteryFillWidth = kBatteryBarWidth * animatedBattery / 100;
 
     char batteryLabel[24];
-    std::snprintf(batteryLabel, sizeof(batteryLabel), "BATTERY  %d%%", animatedBattery);
-    M5.Display.setTextSize(0.58f);
+    if (g_language == LANG_ZH) {
+        std::snprintf(batteryLabel, sizeof(batteryLabel), "电量  %d%%", animatedBattery);
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+    } else {
+        std::snprintf(batteryLabel, sizeof(batteryLabel), "BATTERY  %d%%", animatedBattery);
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.58f);
+    }
     M5.Display.setTextColor(batteryColor, TFT_BLACK);
     M5.Display.drawString(batteryLabel, kScreenCenter, 338);
     M5.Display.fillRoundRect(kBatteryBarX, kBatteryBarY, kBatteryBarWidth,
@@ -1706,6 +2093,20 @@ void loop() {
     }
 
     const std::uint32_t now = millis();
+    if (g_lastActivityAt == 0) {
+        g_lastActivityAt = now;
+    }
+
+    // Auto-dimming & screen sleep
+    if (!g_isDimmed && !g_isScreenSleeping && (now - g_lastActivityAt >= kDimTimeoutMs)) {
+        g_isDimmed = true;
+        M5.Display.setBrightness(15);
+    }
+    if (!g_isScreenSleeping && (now - g_lastActivityAt >= kSleepTimeoutMs)) {
+        g_isScreenSleeping = true;
+        M5.Display.setBrightness(0);
+    }
+
     if (g_restartAt != 0 && static_cast<std::int32_t>(now - g_restartAt) >= 0) {
         ESP.restart();
     }
@@ -1718,7 +2119,8 @@ void loop() {
     }
     const std::uint32_t uiPeriod = g_selectionAnimating ? kSelectionAnimationPeriodMs
                                                         : kUiAnimationPeriodMs;
-    if ((g_uiDirty || uiIsAnimated()) && now - g_lastUiDraw >= uiPeriod) {
+    const bool shouldRedrawQuota = g_quota.available && (now - g_lastUiDraw >= 1000);
+    if (!g_isScreenSleeping && (g_uiDirty || uiIsAnimated() || shouldRedrawQuota) && now - g_lastUiDraw >= uiPeriod) {
         renderUi(now);
     }
 

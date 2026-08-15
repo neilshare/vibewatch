@@ -4,3 +4,8 @@
 .vscode/launch.json
 .vscode/ipch/
 compile_commands.json
+.venv/
+.DS_Store
+.build/
+companion/.build/
+companion/.swiftpm/
