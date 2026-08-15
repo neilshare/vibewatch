@@ -507,6 +507,9 @@ private struct Options {
     var verbose = false
     var deviceIdentifier: UUID?
     var enterBootloader = false
+    var approval = false
+    var approvalType = "EXEC"
+    var approvalSummary = "Run Command"
 }
 
 private func executableInPath(named executable: String) -> String? {
@@ -552,6 +555,16 @@ private func parseOptions() throws -> Options {
             options.codexPath = arguments[index]
         case "--demo":
             options.demo = true
+        case "--approval":
+            options.approval = true
+        case "--type":
+            index += 1
+            guard index < arguments.count else { throw CompanionError.usage("--type 需要类型名称") }
+            options.approvalType = arguments[index]
+        case "--summary":
+            index += 1
+            guard index < arguments.count else { throw CompanionError.usage("--summary 需要描述文本") }
+            options.approvalSummary = arguments[index]
         case "--json-only":
             options.jsonOnly = true
         case "--watch":
@@ -574,11 +587,14 @@ private func parseOptions() throws -> Options {
             options.verbose = true
         case "--help", "-h":
             print("""
-            用法: codex-watch-companion --device-id UUID [--watch] [--interval 60] [-v]
+            用法: codex-watch-companion [--watch] [--interval 60] [--approval --type EXEC --summary "..."] [-v]
 
               --watch          持续刷新；默认只写入一次
               --interval N     额度刷新间隔，至少 10 秒，默认 60
               --demo           使用合成额度，不启动 Codex App Server
+              --approval       向手表发送人工确认弹窗
+              --type T         确认类型 (例如 EXEC, WRITE, SCRIPT)
+              --summary S      确认描述摘要
               --json-only      只打印 JSON，不连接蓝牙
               --device-id UUID 只向这块已绑定的 StopWatch 写入
               --enter-bootloader
@@ -604,12 +620,32 @@ private func formatReset(seconds: Int) -> String {
 private func run() throws {
     setbuf(stdout, nil)
     setbuf(stderr, nil)
-    // launchd starts this executable directly from its .app bundle. Creating
-    // the background NSApplication registers that process with the logged-in
-    // Aqua session so CoreBluetooth can deliver delegate callbacks reliably.
     _ = NSApplication.shared
     NSApplication.shared.setActivationPolicy(.prohibited)
     let options = try parseOptions()
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+
+    if options.approval {
+        struct ApprovalMsg: Encodable {
+            let method: String = "v.oai.approval_req"
+            struct Params: Encodable {
+                let active: Bool
+                let type: String
+                let summary: String
+            }
+            let params: Params
+        }
+        let payload = try encoder.encode(ApprovalMsg(params: .init(active: true, type: options.approvalType, summary: options.approvalSummary)))
+        _ = try BLEQuotaWriter(
+            payload: payload,
+            verbose: options.verbose,
+            expectedIdentifier: options.deviceIdentifier
+        ).write()
+        print("✓ 已向 StopWatch 发送人工确认请求：[\(options.approvalType)] \(options.approvalSummary)")
+        return
+    }
+
     if options.enterBootloader {
         guard options.deviceIdentifier != nil else {
             throw CompanionError.usage("--enter-bootloader 必须同时提供 --device-id")
@@ -633,8 +669,6 @@ private func run() throws {
         }
         return
     }
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     var client: AppServerClient?
     if !options.demo {
         client = try AppServerClient(codexPath: options.codexPath)

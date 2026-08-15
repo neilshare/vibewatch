@@ -161,6 +161,46 @@ void applyQuotaStatus(JsonVariantConst params) {
     }
 }
 
+void noteActivity();
+void vibrate(std::uint8_t strength = 120, std::uint32_t durationMs = 25);
+void playSe(float frequency = 880.0f, std::uint32_t durationMs = 35);
+
+struct ApprovalState {
+    bool active = false;
+    int agentId = 0;
+    char type[24] = "EXEC";
+    char summary[96] = "";
+    std::uint32_t triggeredAtMs = 0;
+};
+ApprovalState g_approval;
+
+void applyApprovalRequest(JsonVariantConst params) {
+    if (params.isNull()) return;
+    if (params.is<JsonObjectConst>()) {
+        JsonObjectConst obj = params.as<JsonObjectConst>();
+        const bool active = obj["active"] | true;
+        if (!active) {
+            g_approval.active = false;
+            g_uiDirty = true;
+            return;
+        }
+        g_approval.active = true;
+        g_approval.agentId = obj["agent"] | obj["agentId"] | 0;
+        const char* t = obj["type"] | obj["t"] | "EXEC";
+        const char* s = obj["summary"] | obj["desc"] | obj["s"] | "Run Command";
+        std::strncpy(g_approval.type, t, sizeof(g_approval.type) - 1);
+        g_approval.type[sizeof(g_approval.type) - 1] = '\0';
+        std::strncpy(g_approval.summary, s, sizeof(g_approval.summary) - 1);
+        g_approval.summary[sizeof(g_approval.summary) - 1] = '\0';
+        g_approval.triggeredAtMs = millis();
+        noteActivity();
+        vibrate(250, 90);
+        playSe(1250.0f, 75);
+        g_uiDirty = true;
+        Serial.printf("Approval request received: type=%s summary=%s\n", g_approval.type, g_approval.summary);
+    }
+}
+
 class QuotaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
         const NimBLEAttValue value = characteristic->getValue();
@@ -171,6 +211,19 @@ class QuotaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, data, length);
         if (!err) {
+            if (doc.is<JsonObjectConst>()) {
+                JsonObjectConst root = doc.as<JsonObjectConst>();
+                const char* method = root["method"] | root["m"] | root["op"] | "";
+                if (std::strcmp(method, "v.oai.approval_req") == 0 ||
+                    std::strcmp(method, "approval") == 0 ||
+                    std::strcmp(method, "prompt") == 0) {
+                    JsonVariantConst p = root["params"];
+                    if (p.isNull()) p = root["p"];
+                    if (p.isNull()) p = doc.as<JsonVariantConst>();
+                    applyApprovalRequest(p);
+                    return;
+                }
+            }
             applyQuotaStatus(doc.as<JsonVariantConst>());
         } else {
             Serial.printf("Quota JSON parse failed: %s\n", err.c_str());
@@ -303,7 +356,7 @@ void saveFeedbackSettings() {
     preferences.end();
 }
 
-void playSe(float frequency = 880.0f, std::uint32_t durationMs = 35) {
+void playSe(float frequency, std::uint32_t durationMs) {
     sound::playSquare(frequency, durationMs, g_seVolume);
 }
 
@@ -352,7 +405,7 @@ bool uiIsAnimated() {
     return false;
 }
 
-void vibrate(std::uint8_t strength = 120, std::uint32_t durationMs = 25) {
+void vibrate(std::uint8_t strength, std::uint32_t durationMs) {
     if (strength == 0 || g_vibrationStrength == 0) {
         return;
     }
@@ -578,6 +631,8 @@ void processRpc(const char* json) {
         applyFocusedApp(params);
     } else if (std::strcmp(method, "v.oai.quota") == 0 || std::strcmp(method, "quota") == 0) {
         applyQuotaStatus(params);
+    } else if (std::strcmp(method, "v.oai.approval_req") == 0 || std::strcmp(method, "approval") == 0 || std::strcmp(method, "v.oai.prompt") == 0) {
+        applyApprovalRequest(params);
     }
 
     if (id >= 0 && method[0] != '\0') {
@@ -1009,6 +1064,31 @@ void handleTouch() {
         noteActivity();
     }
 
+    if (g_approval.active) {
+        if (touch.wasPressed()) {
+            if (touch.x < kScreenCenter && touch.y > 270) { // Left / NG
+                g_approval.active = false;
+                sendOuterActionEvent(kNgAction, true);
+                delay(20);
+                sendOuterActionEvent(kNgAction, false);
+                playSe(450.0f, 60);
+                vibrate(120, 35);
+                g_uiDirty = true;
+                return;
+            } else if (touch.x >= kScreenCenter && touch.y > 270) { // Right / OK
+                g_approval.active = false;
+                sendOuterActionEvent(kOkAction, true);
+                delay(20);
+                sendOuterActionEvent(kOkAction, false);
+                playSe(1350.0f, 60);
+                vibrate(180, 50);
+                g_uiDirty = true;
+                return;
+            }
+        }
+        return;
+    }
+
     if (g_settingsOpen) {
         handleSettingsTouch(touch);
         return;
@@ -1117,7 +1197,30 @@ void handlePhysicalButtons() {
     if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnA.isPressed() || M5.BtnB.isPressed()) {
         noteActivity();
     }
-    // Treat the two physical buttons as a chord before dispatching either
+
+    if (g_approval.active) {
+        if (M5.BtnA.wasPressed()) { // Left physical button -> Reject
+            g_approval.active = false;
+            sendOuterActionEvent(kNgAction, true);
+            delay(20);
+            sendOuterActionEvent(kNgAction, false);
+            playSe(450.0f, 60);
+            vibrate(120, 35);
+            g_uiDirty = true;
+            return;
+        }
+        if (M5.BtnB.wasPressed()) { // Right physical button -> Approve
+            g_approval.active = false;
+            sendOuterActionEvent(kOkAction, true);
+            delay(20);
+            sendOuterActionEvent(kOkAction, false);
+            playSe(1350.0f, 60);
+            vibrate(180, 50);
+            g_uiDirty = true;
+            return;
+        }
+        return;
+    }
     // single-button action. The short grace period prevents an Agent/OK/NG
     // event from leaking out when the user's intention is to switch layers.
     if (!g_buttonChordActive && M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
@@ -1415,6 +1518,101 @@ void drawPhysicalActionLinks() {
     M5.Display.drawWideLine(393, 28, 381, 58, rightActive ? 14.0f : 11.0f, rightGlow);
     M5.Display.drawWideLine(399, 0, 393, 28, 5.0f, rightActive ? TFT_WHITE : rightColor);
     M5.Display.drawWideLine(393, 28, 381, 58, 5.0f, rightActive ? TFT_WHITE : rightColor);
+}
+
+void drawApprovalOverlay() {
+    if (!g_approval.active) return;
+
+    const auto cardBg = M5.Display.color565(22, 25, 34);
+    const auto amberWarning = M5.Display.color565(255, 172, 54);
+    const auto greenOk = M5.Display.color565(43, 201, 110);
+    const auto redNg = M5.Display.color565(245, 90, 104);
+    const auto muted = M5.Display.color565(180, 188, 205);
+
+    constexpr int cardX = 63;
+    constexpr int cardY = 88;
+    constexpr int cardW = 340;
+    constexpr int cardH = 290;
+    constexpr int cardR = 24;
+
+    M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, cardR, cardBg);
+    drawThickRoundRect(cardX, cardY, cardW, cardH, cardR, 3, amberWarning);
+
+    M5.Display.setTextDatum(middle_center);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.15f);
+        M5.Display.setTextColor(amberWarning, cardBg);
+        M5.Display.drawString("! 需要人工确认", kScreenCenter, cardY + 32);
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.66f);
+        M5.Display.setTextColor(amberWarning, cardBg);
+        M5.Display.drawString("APPROVAL REQUIRED", kScreenCenter, cardY + 32);
+    }
+
+    char typeLabel[32];
+    std::snprintf(typeLabel, sizeof(typeLabel), "[ %s ]", g_approval.type);
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
+    M5.Display.setTextSize(0.55f);
+    M5.Display.setTextColor(TFT_WHITE, cardBg);
+    M5.Display.drawString(typeLabel, kScreenCenter, cardY + 70);
+
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.0f);
+    } else {
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(0.82f);
+    }
+    M5.Display.setTextColor(muted, cardBg);
+
+    const int summaryLen = std::strlen(g_approval.summary);
+    if (summaryLen > 20) {
+        char line1[32] = {};
+        char line2[32] = {};
+        std::strncpy(line1, g_approval.summary, 18);
+        std::strncpy(line2, g_approval.summary + 18, 22);
+        M5.Display.drawString(line1, kScreenCenter, cardY + 118);
+        M5.Display.drawString(line2, kScreenCenter, cardY + 148);
+    } else {
+        M5.Display.drawString(g_approval.summary[0] != '\0' ? g_approval.summary : "Execute command?", kScreenCenter, cardY + 130);
+    }
+
+    constexpr int btnY = cardY + cardH - 64;
+    constexpr int btnW = 130;
+    constexpr int btnH = 48;
+    constexpr int btnR = 14;
+
+    // NG Button (Left)
+    const int ngX = cardX + 22;
+    M5.Display.fillRoundRect(ngX, btnY, btnW, btnH, btnR, redNg);
+    drawThickRoundRect(ngX, btnY, btnW, btnH, btnR, 2, TFT_WHITE);
+    M5.Display.setTextColor(TFT_WHITE, redNg);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.05f);
+        M5.Display.drawString("拒绝 [左键]", ngX + btnW / 2, btnY + btnH / 2);
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.60f);
+        M5.Display.drawString("NG [LEFT]", ngX + btnW / 2, btnY + btnH / 2);
+    }
+
+    // OK Button (Right)
+    const int okX = cardX + cardW - btnW - 22;
+    M5.Display.fillRoundRect(okX, btnY, btnW, btnH, btnR, greenOk);
+    drawThickRoundRect(okX, btnY, btnW, btnH, btnR, 2, TFT_WHITE);
+    M5.Display.setTextColor(TFT_WHITE, greenOk);
+    if (g_language == LANG_ZH) {
+        M5.Display.setFont(&fonts::efontCN_16);
+        M5.Display.setTextSize(1.05f);
+        M5.Display.drawString("确认 [右键]", okX + btnW / 2, btnY + btnH / 2);
+    } else {
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.60f);
+        M5.Display.drawString("OK [RIGHT]", okX + btnW / 2, btnY + btnH / 2);
+    }
 }
 
 void drawFastGlyph(int x, int y, std::uint16_t color) {
@@ -1884,6 +2082,10 @@ void renderUi(std::uint32_t now) {
 
     if (!g_actionLayer) {
         drawStatusBar();
+    }
+
+    if (g_approval.active) {
+        drawApprovalOverlay();
     }
 
     M5.Display.endWrite();
