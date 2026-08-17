@@ -13,6 +13,7 @@
 #include <string>
 
 #include "vibe_hid.h"
+#include "vibe_state.h"
 #include "sound.h"
 
 namespace {
@@ -23,8 +24,6 @@ namespace {
 
 // The StopWatch display is 466 x 466 pixels. All primary controls are arranged
 // around the physical center so the layout visually follows the round bezel.
-constexpr int kAgentCount = 6;
-constexpr int kActionCount = 5;
 constexpr int kOkAction = 1;
 constexpr int kNgAction = 2;
 constexpr int kScreenCenter = 233;
@@ -51,14 +50,20 @@ constexpr std::uint32_t kBatteryUpdatePeriodMs = 30000;
 constexpr char kPreferencesNamespace[] = "vibe-watch";
 constexpr char kDeviceSlotKey[] = "device-slot";
 constexpr char kSeVolumeKey[] = "se-volume";
-constexpr char kVibrationStrengthKey[] = "vibe-strength";
-constexpr char kAgentStateVibeKey[] = "state-vibe";
-constexpr char kLanguageKey[] = "language";
-
-enum Language : std::uint8_t {
-    LANG_ZH = 0,
-    LANG_EN = 1,
-};
+using vibe::kAgentCount;
+using vibe::kActionCount;
+using vibe::AgentCard;
+using vibe::CARD_CODEX;
+using vibe::CARD_WORKBUDDY;
+using vibe::CARD_ANTIGRAVITY;
+using vibe::CARD_COUNT;
+using vibe::Language;
+using vibe::LANG_ZH;
+using vibe::LANG_EN;
+using vibe::AgentState;
+using vibe::QuotaState;
+using vibe::CardState;
+using vibe::ApprovalState;
 
 // Hit-test results share one integer space. Non-negative values below
 // kAgentCount are outer-ring items; the remaining values identify fixed UI
@@ -74,13 +79,6 @@ constexpr int kTouchVolume = kAgentCount + 7;
 constexpr int kTouchVibrationStrength = kAgentCount + 8;
 constexpr int kTouchAgentStateVibe = kAgentCount + 9;
 constexpr int kTouchLanguage = kAgentCount + 10;
-
-struct AgentState {
-    std::uint32_t color = 0;
-    float brightness = 0.0f;
-    int effect = 0;
-    float speed = 0.0f;
-};
 
 struct AmbientState {
     std::uint32_t color = 0x304FFE;
@@ -116,38 +114,9 @@ String g_rxBuffer;
 constexpr char kQuotaServiceUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c01";
 constexpr char kQuotaWriteUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c02";
 
-struct QuotaState {
-    float remainingPercent = 0.0f;
-    std::uint32_t resetInSeconds = 0;
-    std::uint32_t receivedAtMs = 0;
-    bool available = false;
-
-    QuotaState() = default;
-    QuotaState(float rem, std::uint32_t resetSec, std::uint32_t recAt = 0, bool avail = true)
-        : remainingPercent(rem), resetInSeconds(resetSec), receivedAtMs(recAt), available(avail) {}
-};
-
-enum AgentCard : std::uint8_t {
-    CARD_CODEX = 0,
-    CARD_WORKBUDDY = 1,
-    CARD_ANTIGRAVITY = 2,
-    CARD_COUNT = 3
-};
-
-struct CardState {
-    const char* name;
-    std::uint32_t primaryColor;
-    QuotaState quota;
-    std::array<AgentState, kAgentCount> agents;
-    int selectedAgent;
-
-    CardState(const char* n, std::uint32_t c, QuotaState q, int sel = 0)
-        : name(n), primaryColor(c), quota(q), selectedAgent(sel) {}
-};
-
 std::array<CardState, CARD_COUNT> g_cards = {{
     CardState("CODEX", 0x12D6B2, QuotaState(86.0f, 369286, 0, true)),
-    CardState("WORKBUDDY", 0x00E5FF, QuotaState(92.0f, 66600, 0, true)),
+    CardState("WORKBUDDY", 0x00E5FF, QuotaState(85.0f, 0, 0, true, 1250.0f, 1500.0f, true)),
     CardState("ANTIGRAVITY", 0x9D74FF, QuotaState(78.0f, 198000, 0, true))
 }};
 
@@ -176,10 +145,15 @@ void applyQuotaStatus(JsonVariantConst params) {
     float remaining = -1.0f;
     std::uint32_t resetSec = 0;
     int targetCard = g_currentCard;
+    float credits = -1.0f;
+    float totalCredits = -1.0f;
+
     if (params.is<JsonObjectConst>()) {
         JsonObjectConst obj = params.as<JsonObjectConst>();
         remaining = obj["remaining_percent"] | obj["remainingPercent"] | -1.0f;
         resetSec = obj["reset_in_seconds"] | obj["resetInSeconds"] | 0U;
+        credits = obj["credits"] | obj["credit"] | obj["balance"] | -1.0f;
+        totalCredits = obj["total_credits"] | obj["totalCredits"] | obj["total"] | -1.0f;
         const char* cardName = obj["card"] | obj["agent"] | "";
         if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
             targetCard = CARD_WORKBUDDY;
@@ -189,14 +163,26 @@ void applyQuotaStatus(JsonVariantConst params) {
             targetCard = CARD_CODEX;
         }
     }
+
+    if (credits >= 0.0f) {
+        g_cards[targetCard].quota.credits = credits;
+        g_cards[targetCard].quota.hasCredits = true;
+        if (totalCredits > 0.0f) {
+            g_cards[targetCard].quota.totalCredits = totalCredits;
+            if (remaining < 0.0f) {
+                remaining = std::max(0.0f, std::min(100.0f, (credits / totalCredits) * 100.0f));
+            }
+        }
+    }
+
     if (remaining >= 0.0f && remaining <= 100.0f) {
         g_cards[targetCard].quota.remainingPercent = remaining;
         g_cards[targetCard].quota.resetInSeconds = resetSec;
         g_cards[targetCard].quota.receivedAtMs = millis();
         g_cards[targetCard].quota.available = true;
         g_uiDirty = true;
-        Serial.printf("Quota update for %s: %.1f%% resetIn=%us\n",
-                      g_cards[targetCard].name, remaining, resetSec);
+        Serial.printf("Quota update for %s: %.1f%% credits=%.1f resetIn=%us\n",
+                      g_cards[targetCard].name, remaining, g_cards[targetCard].quota.credits, resetSec);
     }
 }
 
@@ -204,13 +190,6 @@ void noteActivity();
 void vibrate(std::uint8_t strength = 120, std::uint32_t durationMs = 25);
 void playSe(float frequency = 880.0f, std::uint32_t durationMs = 35);
 
-struct ApprovalState {
-    bool active = false;
-    int agentId = 0;
-    char type[24] = "EXEC";
-    char summary[96] = "";
-    std::uint32_t triggeredAtMs = 0;
-};
 ApprovalState g_approval;
 
 constexpr std::uint32_t kApprovalSwitchCooldownMs = 4000;
@@ -316,6 +295,7 @@ void noteActivity() {
     if (g_isScreenSleeping || g_isDimmed) {
         g_isScreenSleeping = false;
         g_isDimmed = false;
+        setCpuFrequencyMhz(240);
         M5.Display.setBrightness(80);
         g_uiDirty = true;
     }
@@ -372,6 +352,11 @@ std::array<int, kActionCount> actionY{};
 // Preferences, sound, color, haptics, and battery helpers
 // -----------------------------------------------------------------------------
 
+constexpr char kVibrationStrengthKey[] = "vibe-strength";
+constexpr char kAgentStateVibeKey[] = "state-vibe";
+constexpr char kLanguageKey[] = "language";
+constexpr char kSavedCardKey[] = "card";
+
 void loadPreferences() {
     Preferences preferences;
     preferences.begin(kPreferencesNamespace, true);
@@ -381,6 +366,10 @@ void loadPreferences() {
     g_agentStateVibeEnabled = preferences.getBool(kAgentStateVibeKey, true);
     g_language = static_cast<Language>(
         preferences.getUChar(kLanguageKey, static_cast<std::uint8_t>(LANG_ZH)));
+    const std::uint8_t savedCard = preferences.getUChar(kSavedCardKey, static_cast<std::uint8_t>(CARD_CODEX));
+    if (savedCard < CARD_COUNT) {
+        g_currentCard = static_cast<AgentCard>(savedCard);
+    }
     preferences.end();
     if (g_deviceSlot < 1 || g_deviceSlot > 3) {
         g_deviceSlot = 1;
@@ -390,6 +379,13 @@ void loadPreferences() {
     }
     g_pendingDeviceSlot = g_deviceSlot;
     std::snprintf(g_deviceName, sizeof(g_deviceName), "%s%d", vibe::kDeviceNamePrefix, g_deviceSlot);
+}
+
+void saveCurrentCard() {
+    Preferences preferences;
+    preferences.begin(kPreferencesNamespace, false);
+    preferences.putUChar(kSavedCardKey, static_cast<std::uint8_t>(g_currentCard));
+    preferences.end();
 }
 
 void saveLanguage() {
@@ -1234,6 +1230,7 @@ void handleTouch() {
                     // Swipe Right -> Prev Card
                     g_currentCard = static_cast<AgentCard>((g_currentCard + CARD_COUNT - 1) % CARD_COUNT);
                 }
+                saveCurrentCard();
                 g_activeSwipe = dx > 0 ? 1 : 3;
                 playSe(1150.0f, 35);
                 vibrate(100, 30);
@@ -2181,30 +2178,65 @@ void renderUi(std::uint32_t now) {
         const auto textColor = quotaStale ? M5.Display.color565(180, 150, 100) : currentPrimaryColor;
         const auto mutedColor = M5.Display.color565(130, 142, 160);
 
-        // Top line: Pure technical label e.g. "WEEKLY"
-        M5.Display.setFont(&fonts::Orbitron_Light_24);
-        M5.Display.setTextSize(0.48f);
-        M5.Display.setTextColor(mutedColor, micFill);
-        M5.Display.drawString(quotaStale ? "SYNC STALE" : "WEEKLY", kScreenCenter, kScreenCenter - 34);
+        if (g_currentCard == CARD_WORKBUDDY || quota.hasCredits) {
+            // Workbuddy Credit Mode:
+            // Top line: Pure technical label "CREDITS"
+            M5.Display.setFont(&fonts::Orbitron_Light_24);
+            M5.Display.setTextSize(0.48f);
+            M5.Display.setTextColor(mutedColor, micFill);
+            M5.Display.drawString(quotaStale ? "SYNC STALE" : "CREDITS", kScreenCenter, kScreenCenter - 34);
 
-        // Center line: Crisp percentage
-        char quotaText[16];
-        std::snprintf(quotaText, sizeof(quotaText), "%.0f%%", quota.remainingPercent);
-        M5.Display.setFont(&fonts::Orbitron_Light_32);
-        M5.Display.setTextSize(0.85f);
-        M5.Display.setTextColor(textColor, micFill);
-        M5.Display.drawString(quotaText, kScreenCenter, kScreenCenter - 1);
+            // Center line: Large Credit count e.g. "1250" or "850"
+            char creditText[20];
+            const float crVal = quota.credits > 0.0f ? quota.credits : (quota.remainingPercent * 15.0f);
+            if (crVal >= 10000.0f) {
+                std::snprintf(creditText, sizeof(creditText), "%.1fK", crVal / 1000.0f);
+            } else {
+                std::snprintf(creditText, sizeof(creditText), "%.0f", crVal);
+            }
+            M5.Display.setFont(&fonts::Orbitron_Light_32);
+            M5.Display.setTextSize(0.85f);
+            M5.Display.setTextColor(textColor, micFill);
+            M5.Display.drawString(creditText, kScreenCenter, kScreenCenter - 1);
 
-        // Bottom line: Minimal concise countdown e.g. "RESET 1H 00M"
-        char resetStr[24];
-        const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
-        const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
-        formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+            // Bottom line: Subtitle e.g. "1250 CR" or "TOTAL 1500" or "85% LEFT"
+            char creditSub[24];
+            if (quota.totalCredits > 0.0f) {
+                std::snprintf(creditSub, sizeof(creditSub), "TOTAL %.0f", quota.totalCredits);
+            } else {
+                std::snprintf(creditSub, sizeof(creditSub), "%.0f CR LEFT", crVal);
+            }
+            M5.Display.setFont(&fonts::Orbitron_Light_24);
+            M5.Display.setTextSize(0.46f);
+            M5.Display.setTextColor(quotaStale ? mutedColor : TFT_WHITE, micFill);
+            M5.Display.drawString(creditSub, kScreenCenter, kScreenCenter + 32);
+        } else {
+            // Top line: Pure technical label e.g. "WEEKLY"
+            M5.Display.setFont(&fonts::Orbitron_Light_24);
+            M5.Display.setTextSize(0.48f);
+            M5.Display.setTextColor(mutedColor, micFill);
+            M5.Display.drawString(quotaStale ? "SYNC STALE" : (g_currentCard == CARD_ANTIGRAVITY ? "MONTHLY" : "WEEKLY"),
+                                  kScreenCenter, kScreenCenter - 34);
 
-        M5.Display.setFont(&fonts::Orbitron_Light_24);
-        M5.Display.setTextSize(0.46f);
-        M5.Display.setTextColor(quotaStale ? mutedColor : TFT_WHITE, micFill);
-        M5.Display.drawString(resetStr, kScreenCenter, kScreenCenter + 32);
+            // Center line: Crisp percentage
+            char quotaText[16];
+            std::snprintf(quotaText, sizeof(quotaText), "%.0f%%", quota.remainingPercent);
+            M5.Display.setFont(&fonts::Orbitron_Light_32);
+            M5.Display.setTextSize(0.85f);
+            M5.Display.setTextColor(textColor, micFill);
+            M5.Display.drawString(quotaText, kScreenCenter, kScreenCenter - 1);
+
+            // Bottom line: Minimal concise countdown e.g. "RESET 1H 00M"
+            char resetStr[24];
+            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
+            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+
+            M5.Display.setFont(&fonts::Orbitron_Light_24);
+            M5.Display.setTextSize(0.46f);
+            M5.Display.setTextColor(quotaStale ? mutedColor : TFT_WHITE, micFill);
+            M5.Display.drawString(resetStr, kScreenCenter, kScreenCenter + 32);
+        }
     } else {
         drawLargeMicGlyph(kScreenCenter, kScreenCenter - 2, TFT_WHITE);
     }
@@ -2436,14 +2468,16 @@ void loop() {
         g_lastActivityAt = now;
     }
 
-    // Auto-dimming & screen sleep
+    // Auto-dimming & screen sleep with Dynamic CPU Frequency Scaling (DVFS)
     if (!g_isDimmed && !g_isScreenSleeping && (now - g_lastActivityAt >= kDimTimeoutMs)) {
         g_isDimmed = true;
         M5.Display.setBrightness(15);
+        setCpuFrequencyMhz(160);
     }
     if (!g_isScreenSleeping && (now - g_lastActivityAt >= kSleepTimeoutMs)) {
         g_isScreenSleeping = true;
         M5.Display.setBrightness(0);
+        setCpuFrequencyMhz(80);
     }
 
     if (g_restartAt != 0 && static_cast<std::int32_t>(now - g_restartAt) >= 0) {

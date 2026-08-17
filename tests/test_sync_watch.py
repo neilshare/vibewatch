@@ -51,3 +51,20 @@ def test_tri_agent_card_names():
         payload = json.dumps({"card": c, "remaining_percent": 50.0, "reset_in_seconds": 3600})
         parsed = json.loads(payload)
         assert parsed["card"] in valid_cards
+
+
+def test_workbuddy_credits_payload():
+    data = {
+        "card": "workbuddy",
+        "credits": 1250.0,
+        "total_credits": 1500.0,
+        "remaining_percent": 83.3,
+        "reset_in_seconds": 0
+    }
+    payload = json.dumps(data).encode("utf-8")
+    parsed = json.loads(payload.decode("utf-8"))
+    assert parsed["card"] == "workbuddy"
+    assert parsed["credits"] == 1250.0
+    assert parsed["total_credits"] == 1500.0
+    assert parsed["remaining_percent"] == 83.3
+

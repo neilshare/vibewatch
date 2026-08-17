@@ -8,14 +8,18 @@ private let quotaWriteUUID = CBUUID(string: "7F0D4E66-2AC2-4A71-BFBE-4EF61A0E5C0
 private let hidServiceUUID = CBUUID(string: "1812")
 
 private struct QuotaSnapshot: Codable {
-    let remainingPercent: Double
-    let resetInSeconds: Int
+    var remainingPercent: Double
+    var resetInSeconds: Int
     var card: String?
+    var credits: Double?
+    var totalCredits: Double?
 
     enum CodingKeys: String, CodingKey {
         case remainingPercent = "remaining_percent"
         case resetInSeconds = "reset_in_seconds"
         case card = "card"
+        case credits = "credits"
+        case totalCredits = "total_credits"
     }
 }
 
@@ -513,6 +517,8 @@ private struct Options {
     var approvalType = "EXEC"
     var approvalSummary = "Run Command"
     var card: String?
+    var credits: Double?
+    var totalCredits: Double?
 }
 
 private func executableInPath(named executable: String) -> String? {
@@ -562,6 +568,14 @@ private func parseOptions() throws -> Options {
             index += 1
             guard index < arguments.count else { throw CompanionError.usage("--card 需要系统名称 (codex, workbuddy, antigravity)") }
             options.card = arguments[index]
+        case "--credits", "--credit", "--balance":
+            index += 1
+            guard index < arguments.count, let cr = Double(arguments[index]) else { throw CompanionError.usage("--credits 需要有效数字") }
+            options.credits = cr
+        case "--total-credits", "--total":
+            index += 1
+            guard index < arguments.count, let tot = Double(arguments[index]) else { throw CompanionError.usage("--total-credits 需要有效数字") }
+            options.totalCredits = tot
         case "--approval":
             options.approval = true
         case "--type":
@@ -687,13 +701,17 @@ private func run() throws {
         var snapshot: QuotaSnapshot
         if options.demo {
             snapshot = QuotaSnapshot(
-                remainingPercent: 59,
-                resetInSeconds: 3_600,
-                card: options.card
+                remainingPercent: (options.card?.lowercased() == "workbuddy" || options.credits != nil) ? 85 : 59,
+                resetInSeconds: (options.card?.lowercased() == "workbuddy") ? 0 : 3_600,
+                card: options.card,
+                credits: options.credits ?? (options.card?.lowercased() == "workbuddy" ? 1250 : nil),
+                totalCredits: options.totalCredits ?? (options.card?.lowercased() == "workbuddy" ? 1500 : nil)
             )
         } else {
             snapshot = try client!.readRateLimits()
             snapshot.card = options.card
+            if let cr = options.credits { snapshot.credits = cr }
+            if let tot = options.totalCredits { snapshot.totalCredits = tot }
         }
 
         let payload = try encoder.encode(snapshot)
