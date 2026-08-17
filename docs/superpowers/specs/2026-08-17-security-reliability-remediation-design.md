@@ -73,11 +73,11 @@ The existing quota service remains discoverable, but approval and quota traffic 
 The service exposes:
 
 - quota snapshot write characteristic: encrypted write with response;
-- approval request characteristic: encrypted and authenticated write with response;
+- approval request characteristic: encrypted write with response, plus a bonded-peer check in the callback;
 - approval result characteristic: encrypted indication;
 - a one-release legacy adapter on the encrypted approval-request characteristic.
 
-Every callback verifies the current connection is encrypted before enqueueing a message. Approval additionally requires an established bond. Characteristic permissions reject unencrypted writes before the callback; a callback that cannot confirm the expected bonded peer disconnects it without triggering UI, sound, vibration, quota updates, or queue allocation.
+Every callback verifies the current connection is encrypted before enqueueing a message. Approval additionally requires an established bond. Characteristic permissions reject unencrypted writes before the callback; a callback that cannot confirm the expected bonded peer disconnects it without triggering UI, sound, vibration, quota updates, or queue allocation. NimBLE's `WRITE_AUTHEN` permission is intentionally not used in this release because the current `NO_INPUT_OUTPUT` pairing configuration does not provide MITM authentication; adding display-based numeric comparison is a separate pairing-UX enhancement rather than silently making the characteristic unwritable.
 
 Real host operations require `--device-id`. Name- or service-based discovery without a pinned identifier is allowed only for `--demo`, whose output must clearly state that it is discovery/demo mode. A real operation never falls back from a missing bound device to another same-name peripheral.
 
