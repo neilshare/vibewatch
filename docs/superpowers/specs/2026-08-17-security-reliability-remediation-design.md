@@ -22,6 +22,8 @@ The following work is intentionally out of scope:
 - replacing JSON with a binary serialization format;
 - creating a general-purpose event bus for every firmware subsystem.
 
+One targeted readability correction is in scope: the `1` through `6` labels inside the six agent circles are currently too small to read reliably and will be rendered at twice their current character scale.
+
 ## Compatibility Policy
 
 Approval protocol v2 is the default and authoritative path. It returns a decision correlated to a unique request identifier.
@@ -158,6 +160,12 @@ A valid snapshot records `receivedAtMs`. When it exceeds the existing stale inte
 
 Credit values and percentages are validated before state mutation. An invalid update leaves the previous valid snapshot unchanged and produces an explicit host error when the transport supports responses.
 
+## Agent Label Readability
+
+In the normal agent layer, the six numeric labels use the existing `Orbitron_Light_32` font with text scale increased from `1.0` to `2.0`. The circle radius, orbit positions, selected/pressed outlines, colors, animations, and touch targets remain unchanged.
+
+The larger label remains centered on each circle and uses the existing luminance-based black/white contrast selection. The change does not apply to the action layer labels or glyphs (`FAST`, `OK`, `NG`, `PLAN`, and `AI`). Rendering must explicitly set the numeric text scale before drawing and restore the expected scale afterward so later quota and status text is unaffected.
+
 ## Host Behavior
 
 ### Swift companion
@@ -205,6 +213,8 @@ Host-native tests cover:
 - legacy mode selected only by the explicit host option and accepted only on the encrypted characteristic;
 - quota unavailable/fresh/stale transitions;
 - queue-capacity behavior and connection-scoped reassembly.
+
+Firmware build and real-device checks additionally verify that the numeric label scale is `2.0` only in the normal agent-layer draw path and that subsequent UI text retains its intended scale.
 
 ### Swift tests
 
@@ -254,6 +264,7 @@ Using one M5Stack StopWatch and one macOS machine, the release candidate must pa
 10. Sleep wake-up, touch decision, physical-button decision, card gestures, microphone, sound, vibration, and battery display still work.
 11. Legacy approval fails by default and succeeds only with the explicit compatibility option.
 12. Repeated disconnect/reconnect and at least 100 approval cycles show no queue leak, heap degradation, crash, or stuck modal.
+13. Labels `1` through `6` render at twice the previous character size, remain centered and fully inside every circle in default, selected, pressed, and animated states, and do not change action-layer typography.
 
 The checklist records firmware commit, companion commit, macOS version, device identifier suffix, pass/fail status, and sanitized log excerpts.
 
@@ -277,3 +288,4 @@ The remediation is complete only when:
 - the real-device acceptance checklist passes in full;
 - protocol and user documentation match the shipped implementation;
 - generated Python bytecode is absent from version control.
+- all six agent-circle numbers are twice their previous character size without clipping or changing hit targets.
