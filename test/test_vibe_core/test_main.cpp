@@ -1,4 +1,5 @@
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include <unity.h>
@@ -117,6 +118,27 @@ void test_enforces_utf8_and_byte_boundaries() {
                                 id, "codex", 0, "EXEC", "bad\xC3", 30000)).error));
 }
 
+void test_rejects_embedded_nuls_in_protocol_strings() {
+    const char* id = "550e8400-e29b-41d4-a716-446655440000";
+    auto kindWithNul = requestJson(id, "codex", 0, "EXEC", "Run", 30000);
+    const auto kindPosition = kindWithNul.find("approval_request");
+    kindWithNul.replace(kindPosition, sizeof("approval_request") - 1, "approval\\u0000request");
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidPayload),
+                            static_cast<std::uint8_t>(decode(kindWithNul).error));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidRequestId),
+                            static_cast<std::uint8_t>(decode(requestJson(
+                                "550e8400-e29b-41d4-a716-446655440000\\u0000", "codex", 0, "EXEC", "Run", 30000)).error));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidCard),
+                            static_cast<std::uint8_t>(decode(requestJson(
+                                id, "codex\\u0000", 0, "EXEC", "Run", 30000)).error));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidOperationType),
+                            static_cast<std::uint8_t>(decode(requestJson(
+                                id, "codex", 0, "EX\\u0000EC", "Run", 30000)).error));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidSummary),
+                            static_cast<std::uint8_t>(decode(requestJson(
+                                id, "codex", 0, "EXEC", "Run\\u0000tests", 30000)).error));
+}
+
 void test_rejects_oversized_payload_and_gates_legacy_shape() {
     TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ProtocolError::InvalidPayload),
                             static_cast<std::uint8_t>(decode(std::string(513, ' ')).error));
@@ -141,6 +163,35 @@ void test_encodes_the_canonical_v2_decision() {
         R"json({"version":2,"kind":"approval_decision","request_id":"550e8400-e29b-41d4-a716-446655440000","decision":"approve","decided_at_ms":184230})json",
         output);
     TEST_ASSERT_EQUAL_UINT(strlen(output), written);
+}
+
+void test_rejects_a_non_terminated_decision_id() {
+    ApprovalDecisionV2 decision{};
+    std::memset(decision.requestId, 'a', sizeof(decision.requestId));
+    decision.choice = ApprovalChoice::Approve;
+    char output[160]{};
+    std::size_t written = 123;
+    TEST_ASSERT_FALSE(encodeApprovalDecision(decision, output, sizeof(output), written));
+    TEST_ASSERT_EQUAL_UINT(0, written);
+}
+
+void test_wraparound_expiry_and_quota_freshness() {
+    constexpr std::uint32_t approvalReceivedAt = std::numeric_limits<std::uint32_t>::max() - 255;
+    ApprovalController controller;
+    controller.accept(request("550e8400-e29b-41d4-a716-446655440000", 5000), approvalReceivedAt);
+    TEST_ASSERT_FALSE(controller.expireIfNeeded(4743).hasValue);
+    const auto expired = controller.expireIfNeeded(4744);
+    TEST_ASSERT_TRUE(expired.hasValue);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(ApprovalChoice::Expired),
+                            static_cast<std::uint8_t>(expired.value.choice));
+
+    QuotaSnapshot quota{};
+    constexpr std::uint32_t quotaReceivedAt = std::numeric_limits<std::uint32_t>::max() - 99;
+    TEST_ASSERT_TRUE(quota.apply(50.0f, 60, 0.0f, 0.0f, quotaReceivedAt));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Fresh),
+                            static_cast<std::uint8_t>(quota.freshness(199, 299)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Stale),
+                            static_cast<std::uint8_t>(quota.freshness(200, 299)));
 }
 
 void test_quota_defaults_apply_validation_and_freshness() {
@@ -177,10 +228,13 @@ void setup() {
     RUN_TEST(test_decodes_the_canonical_v2_request);
     RUN_TEST(test_rejects_invalid_request_id_card_agent_and_ttl);
     RUN_TEST(test_enforces_utf8_and_byte_boundaries);
+    RUN_TEST(test_rejects_embedded_nuls_in_protocol_strings);
     RUN_TEST(test_rejects_oversized_payload_and_gates_legacy_shape);
     RUN_TEST(test_encodes_the_canonical_v2_decision);
+    RUN_TEST(test_rejects_a_non_terminated_decision_id);
     RUN_TEST(test_quota_defaults_apply_validation_and_freshness);
     RUN_TEST(test_quota_accepts_a_snapshot_without_credit_fields);
+    RUN_TEST(test_wraparound_expiry_and_quota_freshness);
     UNITY_END();
 }
 

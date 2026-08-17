@@ -11,8 +11,8 @@ namespace {
 
 constexpr std::size_t kMaxApprovalPayloadLength = 512;
 
-bool isCanonicalUuid(const char* value) {
-    if (value == nullptr || std::strlen(value) != kRequestIdLength - 1) {
+bool isCanonicalUuidBytes(const char* value, std::size_t length) {
+    if (value == nullptr || length != kRequestIdLength - 1) {
         return false;
     }
 
@@ -27,6 +27,20 @@ bool isCanonicalUuid(const char* value) {
         }
     }
     return true;
+}
+
+bool hasEmbeddedNul(JsonString value) {
+    return value.isNull() || std::memchr(value.c_str(), '\0', value.size()) != nullptr;
+}
+
+template <std::size_t N>
+bool equalsLiteral(JsonString value, const char (&literal)[N]) {
+    return !hasEmbeddedNul(value) && value.size() == N - 1 &&
+           std::memcmp(value.c_str(), literal, N - 1) == 0;
+}
+
+bool isCanonicalUuid(JsonString value) {
+    return !hasEmbeddedNul(value) && isCanonicalUuidBytes(value.c_str(), value.size());
 }
 
 bool isContinuationByte(unsigned char value) {
@@ -93,53 +107,57 @@ bool isValidUtf8(const char* value, std::size_t length) {
     return true;
 }
 
-bool parseCard(const char* value, AgentCardId& card) {
-    if (value == nullptr) {
+bool parseCard(JsonString value, AgentCardId& card) {
+    if (hasEmbeddedNul(value)) {
         return false;
     }
 
-    const std::size_t length = std::strlen(value);
+    const std::size_t length = value.size();
     if (length == 0 || length >= 16) {
         return false;
     }
 
     char normalized[16]{};
     for (std::size_t index = 0; index < length; ++index) {
-        normalized[index] = static_cast<char>(std::tolower(static_cast<unsigned char>(value[index])));
+        normalized[index] = static_cast<char>(std::tolower(static_cast<unsigned char>(value.c_str()[index])));
     }
-    if (std::strcmp(normalized, "codex") == 0) {
+    if (std::memcmp(normalized, "codex", sizeof("codex")) == 0) {
         card = AgentCardId::Codex;
         return true;
     }
-    if (std::strcmp(normalized, "workbuddy") == 0) {
+    if (std::memcmp(normalized, "workbuddy", sizeof("workbuddy")) == 0) {
         card = AgentCardId::Workbuddy;
         return true;
     }
-    if (std::strcmp(normalized, "antigravity") == 0) {
+    if (std::memcmp(normalized, "antigravity", sizeof("antigravity")) == 0) {
         card = AgentCardId::Antigravity;
         return true;
     }
     return false;
 }
 
-bool copyText(char* destination, std::size_t capacity, const char* source) {
-    const std::size_t length = std::strlen(source);
-    if (length >= capacity) {
+bool copyText(char* destination, std::size_t capacity, JsonString source) {
+    if (hasEmbeddedNul(source) || source.size() >= capacity) {
         return false;
     }
-    std::memcpy(destination, source, length);
+    std::memcpy(destination, source.c_str(), source.size());
     return true;
 }
 
-ProtocolError validateText(const char* value, std::size_t capacity, ProtocolError error) {
-    if (value == nullptr) {
-        return error;
-    }
-    const std::size_t length = std::strlen(value);
-    if (length == 0 || length >= capacity || !isValidUtf8(value, length)) {
+ProtocolError validateText(JsonString value, std::size_t capacity, ProtocolError error) {
+    if (hasEmbeddedNul(value) || value.size() == 0 || value.size() >= capacity ||
+        !isValidUtf8(value.c_str(), value.size())) {
         return error;
     }
     return ProtocolError::None;
+}
+
+bool getString(JsonVariantConst value, JsonString& string) {
+    if (!value.is<JsonString>()) {
+        return false;
+    }
+    string = value.as<JsonString>();
+    return !string.isNull();
 }
 
 ApprovalDecodeResult decodeV2(JsonObjectConst root) {
@@ -153,19 +171,19 @@ ApprovalDecodeResult decodeV2(JsonObjectConst root) {
         return result;
     }
 
-    const JsonVariantConst kind = root["kind"];
-    if (!kind.is<const char*>() || std::strcmp(kind.as<const char*>(), "approval_request") != 0) {
+    JsonString kind;
+    if (!getString(root["kind"], kind) || !equalsLiteral(kind, "approval_request")) {
         return result;
     }
 
-    const JsonVariantConst requestId = root["request_id"];
-    if (!requestId.is<const char*>() || !isCanonicalUuid(requestId.as<const char*>())) {
+    JsonString requestId;
+    if (!getString(root["request_id"], requestId) || !isCanonicalUuid(requestId)) {
         result.error = ProtocolError::InvalidRequestId;
         return result;
     }
 
-    const JsonVariantConst card = root["card"];
-    if (!card.is<const char*>() || !parseCard(card.as<const char*>(), result.request.card)) {
+    JsonString card;
+    if (!getString(root["card"], card) || !parseCard(card, result.request.card)) {
         result.error = ProtocolError::InvalidCard;
         return result;
     }
@@ -177,24 +195,24 @@ ApprovalDecodeResult decodeV2(JsonObjectConst root) {
     }
     result.request.agentId = agentId.as<std::uint8_t>();
 
-    const JsonVariantConst operation = root["operation_type"];
-    if (!operation.is<const char*>()) {
+    JsonString operation;
+    if (!getString(root["operation_type"], operation)) {
         result.error = ProtocolError::InvalidOperationType;
         return result;
     }
-    if (const auto error = validateText(operation.as<const char*>(), kOperationTypeLength,
+    if (const auto error = validateText(operation, kOperationTypeLength,
                                         ProtocolError::InvalidOperationType);
         error != ProtocolError::None) {
         result.error = error;
         return result;
     }
 
-    const JsonVariantConst summary = root["summary"];
-    if (!summary.is<const char*>()) {
+    JsonString summary;
+    if (!getString(root["summary"], summary)) {
         result.error = ProtocolError::InvalidSummary;
         return result;
     }
-    if (const auto error = validateText(summary.as<const char*>(), kApprovalSummaryLength,
+    if (const auto error = validateText(summary, kApprovalSummaryLength,
                                         ProtocolError::InvalidSummary);
         error != ProtocolError::None) {
         result.error = error;
@@ -208,9 +226,9 @@ ApprovalDecodeResult decodeV2(JsonObjectConst root) {
         return result;
     }
 
-    copyText(result.request.requestId, sizeof(result.request.requestId), requestId.as<const char*>());
-    copyText(result.request.operationType, sizeof(result.request.operationType), operation.as<const char*>());
-    copyText(result.request.summary, sizeof(result.request.summary), summary.as<const char*>());
+    copyText(result.request.requestId, sizeof(result.request.requestId), requestId);
+    copyText(result.request.operationType, sizeof(result.request.operationType), operation);
+    copyText(result.request.summary, sizeof(result.request.summary), summary);
     result.request.ttlMs = ttl.as<std::uint32_t>();
     result.error = ProtocolError::None;
     return result;
@@ -218,28 +236,29 @@ ApprovalDecodeResult decodeV2(JsonObjectConst root) {
 
 ApprovalDecodeResult decodeLegacy(JsonObjectConst root) {
     ApprovalDecodeResult result{};
-    const JsonVariantConst method = root["method"];
     const JsonVariantConst params = root["params"];
-    if (!method.is<const char*>() || std::strcmp(method.as<const char*>(), "v.oai.approval_req") != 0 ||
+    JsonString method;
+    if (!getString(root["method"], method) || !equalsLiteral(method, "v.oai.approval_req") ||
         !params.is<JsonObjectConst>()) {
         return result;
     }
 
     const JsonObjectConst values = params.as<JsonObjectConst>();
     const JsonVariantConst active = values["active"];
-    const JsonVariantConst type = values["type"];
-    const JsonVariantConst summary = values["summary"];
-    if (!active.is<bool>() || !active.as<bool>() || !type.is<const char*>() || !summary.is<const char*>()) {
+    JsonString type;
+    JsonString summary;
+    if (!active.is<bool>() || !active.as<bool>() || !getString(values["type"], type) ||
+        !getString(values["summary"], summary)) {
         return result;
     }
 
-    if (const auto error = validateText(type.as<const char*>(), kOperationTypeLength,
+    if (const auto error = validateText(type, kOperationTypeLength,
                                         ProtocolError::InvalidOperationType);
         error != ProtocolError::None) {
         result.error = error;
         return result;
     }
-    if (const auto error = validateText(summary.as<const char*>(), kApprovalSummaryLength,
+    if (const auto error = validateText(summary, kApprovalSummaryLength,
                                         ProtocolError::InvalidSummary);
         error != ProtocolError::None) {
         result.error = error;
@@ -248,9 +267,12 @@ ApprovalDecodeResult decodeLegacy(JsonObjectConst root) {
 
     result.request.card = AgentCardId::Codex;
     const JsonVariantConst card = values["card"];
-    if (!card.isNull() && (!card.is<const char*>() || !parseCard(card.as<const char*>(), result.request.card))) {
-        result.error = ProtocolError::InvalidCard;
-        return result;
+    if (!card.isNull()) {
+        JsonString cardValue;
+        if (!getString(card, cardValue) || !parseCard(cardValue, result.request.card)) {
+            result.error = ProtocolError::InvalidCard;
+            return result;
+        }
     }
 
     const JsonVariantConst agent = values["agentId"].isNull() ? values["agent"] : values["agentId"];
@@ -262,8 +284,8 @@ ApprovalDecodeResult decodeLegacy(JsonObjectConst root) {
         result.request.agentId = agent.as<std::uint8_t>();
     }
 
-    copyText(result.request.operationType, sizeof(result.request.operationType), type.as<const char*>());
-    copyText(result.request.summary, sizeof(result.request.summary), summary.as<const char*>());
+    copyText(result.request.operationType, sizeof(result.request.operationType), type);
+    copyText(result.request.summary, sizeof(result.request.summary), summary);
     result.request.ttlMs = 30000;
     result.error = ProtocolError::None;
     result.legacy = true;
@@ -307,7 +329,9 @@ bool encodeApprovalDecision(const ApprovalDecisionV2& decision, char* output,
                             std::size_t capacity, std::size_t& written) {
     written = 0;
     const char* choice = decisionName(decision.choice);
-    if (output == nullptr || capacity == 0 || choice == nullptr || !isCanonicalUuid(decision.requestId)) {
+    if (output == nullptr || capacity == 0 || choice == nullptr ||
+        decision.requestId[kRequestIdLength - 1] != '\0' ||
+        !isCanonicalUuidBytes(decision.requestId, kRequestIdLength - 1)) {
         return false;
     }
 
