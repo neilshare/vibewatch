@@ -1,155 +1,147 @@
-# Vibe Watch
+# VibeWatch (随身 AI 编程智能体中枢)
 
-[English](README.md) | [日本語](README.ja.md) | **简体中文**
+[English](README.md) | **简体中文**
 
-[![Firmware build](https://github.com/GOROman/vibewatch/actions/workflows/firmware.yml/badge.svg)](https://github.com/GOROman/vibewatch/actions/workflows/firmware.yml)
+[![Firmware build](https://img.shields.io/badge/PlatformIO-ESP32--S3-orange.svg)](https://platformio.org/)
+[![macOS Companion](https://img.shields.io/badge/macOS-Swift%205.10-blue.svg)](https://swift.org/)
+[![Tests](https://img.shields.io/badge/PyTest-Passing-brightgreen.svg)](tests/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**以M5Stack StopWatch为核心打造的可穿戴触觉控制界面，专为AI辅助Vibe Coding而设计。**
+**专为 Vibe Coding 与多智能体并行编程打造的随身触控硬件中枢 — 基于 M5Stack StopWatch (ESP32-S3 AMOLED)。**
 
-本项目参加[M5Stack Global Innovation Contest 2026](https://m5stack.com/global-innovation-contest-2026)。
+---
 
-![佩戴在手腕上的Vibe Watch及其Vibe Coding操作界面](docs/images/vibe-watch-hero.jpg)
+## 🌟 核心特性 (Key Features)
 
-## 演示视频
-
-[![观看Vibe Watch演示视频](https://img.youtube.com/vi/Wta_rQDcs74/maxresdefault.jpg)](https://www.youtube.com/watch?v=Wta_rQDcs74)
-
-[在YouTube上观看](https://www.youtube.com/watch?v=Wta_rQDcs74)
-
-## 一眼掌握，一触操作，保持专注
-
-Vibe Watch将常用的AI智能体操作从拥挤的桌面界面转移到专用无线设备。它能让六个智能体的状态一目了然，将批准与拒绝变成实体操作，并把Plan模式、助手调用和按住说话功能放到手腕上。
-
-目标很简单：把注意力从操作AI转回与AI共同创造。
-
-## 创作动机
-
-在Vibe Coding中，同时运行多个AI智能体会话已经成为常态。这也带来了新的交互问题：我希望在任务完成的瞬间就能发现它，选择正确的会话，并通过语音输入下一条提示，而不必在多个窗口之间寻找或回到键盘前。
-
-购买[OpenAI Codex Micro](https://learn.chatgpt.com/docs/features/codex-micro)后，专用AI编程硬件的理念给了我灵感。我相信，将圆形屏幕、直接控制、动画、声音、触觉和语音输入结合起来，可以做出更小、更直观、更有表现力的体验。于是，面向并行会话的可穿戴AI驾驶舱Vibe Watch诞生了。
-
-## 使用体验
-
-主**智能体层**将六个实时智能体指示器排列在圆形屏幕周围。主机发送的颜色、亮度和动画用于表达状态；快速弹簧动画让选择环自然移动到下一个智能体。
-
-同时按下两个实体按键，界面会变换为**操作层**：
-
-| 控件 | 体验 |
-|---|---|
-| **FAST** | 触发快速操作 |
-| **NG / OK** | 通过不同的方波音效和振动执行拒绝或批准 |
-| **PLAN** | 切换Plan模式并显示当前状态 |
-| **AI** | 调用AI助手 |
-| **中央麦克风** | 按住进行语音输入 |
-
-左侧橙色按键对应NG，右侧蓝色按键对应OK。彩色连线把实体按键与屏幕操作连接起来，无需说明也能理解它们的关系。
-
-## 界面展示
+### 1. 三大桌面 AI 智能体全功能支持 (Tri-Agent Dashboard)
+通过横向滑动手势，在三大顶尖桌面编程智能体之间自由切换，每个智能体享有完全独立的数据模型、品牌主题色与遥测面板：
 
 <table>
   <tr>
-    <td width="50%" valign="top"><img src="docs/images/vibe-watch-startup.jpg" alt="显示版本和电量的Vibe Watch启动画面"><br><strong>产品化启动体验</strong><br>渐显标识、原创启动音乐与实测电量动画。</td>
-    <td width="50%" valign="top"><img src="docs/images/vibe-watch-agent-layer.jpg" alt="显示六个并行AI会话的智能体层"><br><strong>六个并行智能体</strong><br>无需遮挡编程界面，即可持续查看状态与选择。</td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top"><img src="docs/images/vibe-watch-action-layer.jpg" alt="显示FAST、NG、OK、PLAN、AI和语音输入的操作层"><br><strong>操作层</strong><br>从手腕即时使用FAST、NG、OK、PLAN、AI和语音输入。</td>
-    <td width="50%" valign="top"><img src="docs/images/vibe-watch-settings.jpg" alt="蓝牙配对、音量和振动设置界面"><br><strong>设备内设置</strong><br>直接在手表上调整配对、音效音量、振动强度和状态变化振动。</td>
-  </tr>
-</table>
-
-## 统一的多感官界面
-
-Vibe Watch并不是在宏键盘上加一块装饰屏幕。视觉动画、声音提示、振动、触控和实体按键共同表达同一个交互状态。
-
-- 上升的方波音效确认**OK**，下降的方波音效确认**NG**。
-- 配对成功时同时提供声音和振动反馈。
-- 智能体状态变化可以仅通过可调振动安静提示。
-- 音效音量、振动强度和状态变化振动均可在设备上设置，并在重启后保留。
-
-## M5Stack控制器的使用方式
-
-M5Stack StopWatch是完整的产品界面，而不是连接到其他控制器的被动显示器。
-
-- **ESP32-S3**负责界面、设置存储、电池监测和Bluetooth Low Energy HID通信。
-- **466 × 466圆形触摸屏**显示六智能体空间界面和操作控件。
-- 两个**实体按键**支持无需注视的导航、批准与拒绝。
-- 内置**扬声器**和**振动电机**提供即时且易于区分的反馈。
-- 集成**电池**让控制器可以无线携带。
-
-紧密的软硬件整合把现成的M5Stack控制器变成了专用的人机AI交互界面。
-
-## 从StopWatch到腕表
-
-Vibe Watch将官方[Watch Accessory Kit for M5Stick Series](https://shop.m5stack.com/products/watch-accessory-kit-for-m5stick-series)改造为腕带支架。该套件为矩形M5Stick设备设计，因此需要对塑料Watch Mount Accessory进行少量加工，才能安装圆形StopWatch。
-
-1. 切割前，从设备和表带上取下塑料支架。
-2. 用斜口钳或小型剪钳逐步剪除固定M5Stick的凸起卡扣。
-3. 修整毛刺和尖锐边缘，使粘接面保持平整。
-4. 清洁支架与StopWatch背面，并使其完全干燥。
-5. 将高强度双面胶裁剪到支架轮廓以内，不要遮挡按键、接口或开孔。
-6. 将支架对准StopWatch背面中央，用力压紧，并按照胶带要求等待粘接完成。
-7. 重新安装尼龙表带，佩戴前进行牢固的拉力测试。
-
-### 腕带支架加工照片
-
-<table>
-  <tr>
-    <td width="50%" valign="top"><img src="docs/images/wrist-mount-01-parts.jpg" alt="M5Stack腕表配件套件零件与Vibe Watch"><br><strong>1. 选择支架</strong><br>使用官方套件附带的矩形Watch Mount Accessory。</td>
-    <td width="50%" valign="top"><img src="docs/images/wrist-mount-02-cut-hooks.jpg" alt="剪除支架上的M5Stick固定卡扣"><br><strong>2. 剪除固定卡扣</strong><br>使用小型剪钳逐个小心剪除凸起的M5Stick卡扣。</td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top"><img src="docs/images/wrist-mount-03-trim-hooks.jpg" alt="修整残留的塑料卡扣材料"><br><strong>3. 整平粘接面</strong><br>修整残留塑料并去除尖锐边缘。</td>
-    <td width="50%" valign="top"><img src="docs/images/wrist-mount-04-adhesive.jpg" alt="用高强度双面胶将改造后的支架固定在Vibe Watch背面"><br><strong>4. 粘接并测试</strong><br>用高强度双面胶将支架居中固定，佩戴前进行拉力测试。</td>
+    <td width="33%" align="center">
+      <img src="docs/images/card-codex.jpg" alt="OpenAI Codex 卡片"><br>
+      <strong>🟢 1. OpenAI Codex</strong><br>
+      薄荷青主题 · 周度配额百分比 · 实时重置倒计时
+    </td>
+    <td width="33%" align="center">
+      <img src="docs/images/card-workbuddy.jpg" alt="腾讯 Workbuddy 卡片"><br>
+      <strong>🔵 2. 腾讯 Workbuddy</strong><br>
+      极光蓝主题 · 专属 Credit 点数余额 · 额度总览
+    </td>
+    <td width="33%" align="center">
+      <img src="docs/images/card-antigravity.jpg" alt="Google Antigravity 卡片"><br>
+      <strong>🟣 3. Google Antigravity</strong><br>
+      星系紫主题 · 月度配额与上下文监控
+    </td>
   </tr>
 </table>
 
-这一改造无需切削StopWatch外壳，只使用改造后的套件零件和双面胶。无论坐在桌前还是移动中，界面都能随时使用。
+- **手势无缝切页**：向左/向右滑动屏幕即可流畅切卡，伴随清脆的 **1150Hz 切页音效** 与 **触觉轻震**。
+- **状态持久化 (NVS Memory)**：重启或断电后自动恢复停留在上次选定的智能体卡片。
+- **任务隔离机制**：三张卡片的 6 智能体环、麦克风拾音与审批事件各自携带上下文标识（如 `"c": "WORKBUDDY"`），杜绝跨系统串扰。
 
-## 影响与实用价值
+---
 
-Vibe Watch减少了AI辅助工作中频繁出现的细小中断。它持续显示多个智能体的活动，把批准变成确定的实体动作，并让用户即使离开键盘也能立即开始语音输入。
+### 2. 人工介入审批与防抢占保护 (Human-in-the-Loop Approval)
 
-同样的交互模式还可以扩展到无障碍工具、创意应用、多智能体运维，以及任何注意力比屏幕空间更宝贵的工作流程。
+在 AI 智能体执行敏感操作（读取文件、运行终端命令、执行脚本）需要人工授权时，VibeWatch 会瞬间接管：
 
-## 使用的硬件
+<p align="center">
+  <img src="docs/images/approval-modal.jpg" alt="人工介入审批弹窗" width="400"><br>
+  <em>当智能体需要确认时触发的醒目安全弹窗</em>
+</p>
 
-| 项目 | 数量 | 用途 |
-|---|---:|---|
-| [M5Stack StopWatch](https://docs.m5stack.com/en/core/StopWatch) | 1 | 控制器、显示、输入、声音、振动、BLE和供电 |
-| [M5Stack Watch Accessory Kit for M5Stick Series](https://shop.m5stack.com/products/watch-accessory-kit-for-m5stick-series) | 1 | 尼龙表带和需要改造的Watch Mount Accessory |
-| 高强度双面胶 | 1片 | 将改造后的支架固定到StopWatch |
-| 支持蓝牙的macOS电脑 | 1 | AI编程主机 |
+- **强提醒与自动定向切页**：自动唤醒屏幕、定向切至对应智能体卡片，伴随双重震动警报与 1250Hz 和弦提示音。
+- **操作类型与描述展示**：清晰显示 `[ EXEC ]`、`[ SCRIPT ]`、`[ WRITE ]` 及安全的 UTF-8 中文描述文本。
+- **物理实体按键盲操**：
+  - 👉 **右键 (BtnB) / 屏幕右半区**：一键 **OK (确认/执行)**
+  - 👈 **左键 (BtnA) / 屏幕左半区**：一键 **NG (拒绝/取消)**
+- **4.0 秒防抢占保护窗 (`Anti-Flapping`)**：用户在做决策期间，后台新消息不会暴力打断或跳页，保证决策连贯性。
 
-腕表改造工具：斜口钳或小型剪钳、可选的细锉刀以及护目镜。
+---
 
-## 构建与配对
+### 3. 六子任务环形槽位 & 腕上语音输入 (6-Agent Ring & Push-to-Talk)
+- **6 环形槽位**：围绕 AMOLED 表盘分布 6 个子任务节点，通过脉冲呼吸灯直观展示各子任务的运行/闲置/完成状态。
+- **中心语音拾音 (PTT Mic)**：在任意界面长按中心麦克风区域（或长按右侧物理按键），立即向当前智能体发送语音指令。
 
-安装[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html)，然后克隆公开仓库并构建固件：
+---
 
-```sh
-git clone https://github.com/GOROman/vibewatch.git
+### 4. DVFS 动态调频与极致能耗优化 (Power Optimization)
+- **活跃交互状态**：锁定 **`240MHz`**，确保 60FPS 丝滑动画与亚毫秒级蓝牙响应。
+- **60 秒降亮度**：平滑降频至 **`160MHz`**，有效抑制发热。
+- **180 秒息屏待机**：深度降频至 **`80MHz`**，**降低约 65% 的待机功耗**，轻触屏幕即刻无感恢复全速。
+
+---
+
+## 🛠️ 硬件与系统架构 (Hardware & Architecture)
+
+| 部件 | 规格 / 角色 |
+| :--- | :--- |
+| **主控设备** | [M5Stack StopWatch](https://docs.m5stack.com/en/core/StopWatch) (ESP32-S3, 16MB Flash, 8MB PSRAM) |
+| **显示屏幕** | 1.43 英寸 466 × 466 圆形 AMOLED 电容式触控屏 |
+| **交互输入** | 2 × 物理按键 (左 BtnA / 右 BtnB) + 实体振动马达 + 蜂鸣扬声器 |
+| **无线通信** | Bluetooth Low Energy 5.0 (BLE HID Keyboard + 专属 GATT 遥测通道) |
+| **主机支持** | macOS / Linux / Windows 智能体工作站 |
+
+---
+
+## 💻 快速上手与烧录 (Getting Started)
+
+### 1. 固件编译与烧录
+
+本项目使用 [PlatformIO](https://platformio.org/) 进行管理。将 M5Stack StopWatch 通过 USB-C 数据线连接至电脑：
+
+```bash
+# 1. 克隆代码仓库
+git clone https://github.com/neilshare/vibewatch.git
 cd vibewatch
-python3 -m platformio run -e m5stack-stopwatch
+
+# 2. 编译并烧录固件至手表
+platformio run --target upload
 ```
 
-连接StopWatch并上传：
+---
 
-```sh
-python3 -m platformio run -e m5stack-stopwatch --target upload
+### 2. 蓝牙配对与使用
+
+1. 点击表盘左下角的 **设置 (Settings)** 图标进入设置菜单。
+2. 选择设备槽位（如 Slot 1），点击 **PAIR** 开启配对广播。
+3. 打开电脑蓝牙设置，连接名为 `Vibe Watch #1` 的蓝牙设备。
+
+---
+
+### 3. 主机端遥测与同步 (Companion & CLI)
+
+#### 原生 macOS Swift 伴侣工具 (推荐)
+已为 macOS 编写了基于原生 CoreBluetooth 的伴侣工具，即使已作为 HID 键盘连接也能实现即时 GATT 写入：
+
+```bash
+cd companion && swift build
+
+# 向当前卡片写入额度数据
+./.build/debug/CodexWatchCompanion --card codex
+
+# 向 Workbuddy 同步专属 Credit 点数
+./.build/debug/CodexWatchCompanion --card workbuddy --credits 1250 --total-credits 1500
+
+# 测试触发人工介入审批弹窗
+./.build/debug/CodexWatchCompanion --approval --card workbuddy --type "SCRIPT" --summary "执行自动化测试脚本"
 ```
 
-在Vibe Watch上打开Settings，选择三个设备槽位之一，点击**PAIR**，然后从macOS蓝牙设置连接到`Vibe Watch #n`。
+#### Python 同步脚本
+```bash
+# 安装依赖
+pip install -r requirements.txt  # 或 pip install bleak pytest
 
-## 常见问题与经验教训
+# 运行自动化单元测试
+pytest tests/
 
-- [开发与烧录经验教训 (Lessons Learned)](docs/lessons-learned.md)：包含烧录黑屏/绿灯闪烁排查、ESP32-S3 分区表机制、中英双语字体适配及 NVS 配置保存等核心经验。
+# 自动同步 Codex 额度
+python scripts/sync_watch.py --auto
+```
 
-## 许可证
+---
 
-[MIT License](LICENSE)
+## 📜 许可证 (License)
 
-## 参考资料
-
-- [M5Stack StopWatch — 官方文档](https://docs.m5stack.com/en/core/StopWatch)
-- [M5Stack Watch Accessory Kit for M5Stick Series — 官方产品页面](https://shop.m5stack.com/products/watch-accessory-kit-for-m5stick-series)
-- [OpenAI Codex Micro — 官方文档](https://learn.chatgpt.com/docs/features/codex-micro)
+本项目采用 [MIT License](LICENSE) 开源许可证。
