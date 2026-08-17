@@ -4,6 +4,7 @@
 
 #include <unity.h>
 #include "vibe_approval.h"
+#include "vibe_ingress_core.h"
 #include "vibe_protocol.h"
 #include "vibe_quota.h"
 
@@ -221,6 +222,100 @@ void test_quota_accepts_a_snapshot_without_credit_fields() {
     TEST_ASSERT_EQUAL_FLOAT(0.0f, quota.totalCredits);
 }
 
+void test_ingress_buffer_is_bounded_and_fifo() {
+    IngressBuffer<6, 512> ingress;
+    for (std::uint8_t value = 0; value < 6; ++value) {
+        TEST_ASSERT_EQUAL_UINT8(
+            static_cast<std::uint8_t>(EnqueueResult::Accepted),
+            static_cast<std::uint8_t>(
+                ingress.push(IngressKind::Quota, value + 1, &value, sizeof(value))));
+    }
+
+    const std::uint8_t seventh = 6;
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(EnqueueResult::QueueFull),
+        static_cast<std::uint8_t>(
+            ingress.push(IngressKind::Quota, 7, &seventh, sizeof(seventh))));
+
+    for (std::uint8_t expected = 0; expected < 6; ++expected) {
+        IngressMessage message{};
+        TEST_ASSERT_TRUE(ingress.pop(message));
+        TEST_ASSERT_EQUAL_UINT16(expected + 1, message.connectionHandle);
+        TEST_ASSERT_EQUAL_UINT16(1, message.length);
+        TEST_ASSERT_EQUAL_UINT8(expected, message.payload[0]);
+    }
+    IngressMessage message{};
+    TEST_ASSERT_FALSE(ingress.pop(message));
+}
+
+void test_ingress_buffer_rejects_oversized_payloads() {
+    IngressBuffer<6, 512> ingress;
+    std::array<std::uint8_t, 513> payload{};
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(EnqueueResult::PayloadTooLarge),
+        static_cast<std::uint8_t>(ingress.push(
+            IngressKind::Approval, 1, payload.data(), payload.size())));
+}
+
+void test_ingress_buffer_rejects_missing_payload_bytes() {
+    IngressBuffer<6, 512> ingress;
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(EnqueueResult::PayloadTooLarge),
+        static_cast<std::uint8_t>(
+            ingress.push(IngressKind::Quota, 1, nullptr, 1)));
+}
+
+static HidChunk hidChunk(std::uint16_t handle, const char* payload) {
+    HidChunk chunk{};
+    chunk.connectionHandle = handle;
+    chunk.length = static_cast<std::uint8_t>(std::strlen(payload));
+    std::memcpy(chunk.payload.data(), payload, chunk.length);
+    return chunk;
+}
+
+void test_hid_rpc_assembly_is_connection_scoped_and_main_loop_parsed() {
+    HidRpcAssembler assembler;
+    HidRpcView completed{};
+
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Incomplete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(1, R"json({"method":"one","value":")json"), completed)));
+    TEST_ASSERT_NULL(completed.data);
+
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Complete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(2, R"json({"method":"two"})json"), completed)));
+    TEST_ASSERT_EQUAL_UINT16(2, completed.connectionHandle);
+    TEST_ASSERT_EQUAL_UINT(std::strlen(R"json({"method":"two"})json"), completed.length);
+    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"two"})json", completed.data,
+                             completed.length);
+
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Complete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(1, R"json(done"})json"), completed)));
+    TEST_ASSERT_EQUAL_UINT16(1, completed.connectionHandle);
+    TEST_ASSERT_EQUAL_UINT(std::strlen(R"json({"method":"one","value":"done"})json"),
+                           completed.length);
+    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"one","value":"done"})json",
+                             completed.data, completed.length);
+}
+
+void test_encodes_bounded_v2_protocol_error() {
+    char output[256]{};
+    std::size_t written = 0;
+    TEST_ASSERT_TRUE(encodeProtocolError(
+        "550e8400-e29b-41d4-a716-446655440000",
+        ProtocolErrorCode::Busy, "another request is pending",
+        output, sizeof(output), written));
+    TEST_ASSERT_EQUAL_STRING(
+        R"json({"version":2,"kind":"error","request_id":"550e8400-e29b-41d4-a716-446655440000","code":"busy","message":"another request is pending"})json",
+        output);
+    TEST_ASSERT_EQUAL_UINT(std::strlen(output), written);
+}
+
 void setup() {
     UNITY_BEGIN();
     RUN_TEST(test_accept_duplicate_busy_and_decide);
@@ -235,6 +330,11 @@ void setup() {
     RUN_TEST(test_quota_defaults_apply_validation_and_freshness);
     RUN_TEST(test_quota_accepts_a_snapshot_without_credit_fields);
     RUN_TEST(test_wraparound_expiry_and_quota_freshness);
+    RUN_TEST(test_ingress_buffer_is_bounded_and_fifo);
+    RUN_TEST(test_ingress_buffer_rejects_oversized_payloads);
+    RUN_TEST(test_ingress_buffer_rejects_missing_payload_bytes);
+    RUN_TEST(test_hid_rpc_assembly_is_connection_scoped_and_main_loop_parsed);
+    RUN_TEST(test_encodes_bounded_v2_protocol_error);
     UNITY_END();
 }
 

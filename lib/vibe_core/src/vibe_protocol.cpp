@@ -302,6 +302,18 @@ const char* decisionName(ApprovalChoice choice) {
     return nullptr;
 }
 
+const char* protocolErrorCodeName(ProtocolErrorCode code) {
+    switch (code) {
+        case ProtocolErrorCode::Unauthorized: return "unauthorized";
+        case ProtocolErrorCode::InvalidPayload: return "invalid_payload";
+        case ProtocolErrorCode::UnsupportedVersion: return "unsupported_version";
+        case ProtocolErrorCode::Busy: return "busy";
+        case ProtocolErrorCode::QueueFull: return "queue_full";
+        case ProtocolErrorCode::TransportError: return "transport_error";
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 ApprovalDecodeResult decodeApprovalRequest(const std::uint8_t* data, std::size_t length,
@@ -341,6 +353,41 @@ bool encodeApprovalDecision(const ApprovalDecisionV2& decision, char* output,
     document["request_id"] = decision.requestId;
     document["decision"] = choice;
     document["decided_at_ms"] = decision.decidedAtMs;
+    const std::size_t required = measureJson(document);
+    if (required + 1 > capacity) {
+        return false;
+    }
+    written = serializeJson(document, output, capacity);
+    return written == required;
+}
+
+bool encodeProtocolError(const char* requestId, ProtocolErrorCode code,
+                         const char* message, char* output,
+                         std::size_t capacity, std::size_t& written) {
+    written = 0;
+    const char* codeName = protocolErrorCodeName(code);
+    if (requestId == nullptr || message == nullptr || output == nullptr ||
+        capacity == 0 || codeName == nullptr) {
+        return false;
+    }
+
+    const std::size_t requestIdLength = ::strnlen(requestId, kRequestIdLength);
+    const std::size_t messageLength = ::strnlen(
+        message, kProtocolErrorMessageLength);
+    if ((requestIdLength != 0 &&
+         !isCanonicalUuidBytes(requestId, requestIdLength)) ||
+        requestIdLength == kRequestIdLength || messageLength == 0 ||
+        messageLength >= kProtocolErrorMessageLength ||
+        !isValidUtf8(message, messageLength)) {
+        return false;
+    }
+
+    JsonDocument document;
+    document["version"] = 2;
+    document["kind"] = "error";
+    document["request_id"] = requestId;
+    document["code"] = codeName;
+    document["message"] = message;
     const std::size_t required = measureJson(document);
     if (required + 1 > capacity) {
         return false;

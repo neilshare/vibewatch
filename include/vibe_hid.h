@@ -18,6 +18,7 @@ constexpr std::uint16_t kProductVersion = 0x0001;
 constexpr std::uint8_t kVendorReportId = 6;
 constexpr std::size_t kBleReportLength = 63;
 constexpr std::size_t kRpcChunkLength = 61;
+// Reassembly is connection-scoped and occurs only in Arduino's main loop.
 constexpr std::size_t kRpcBufferLength = 2048;
 constexpr std::uint8_t kChannelDebug = 1;
 constexpr std::uint8_t kChannelJsonRpc = 2;

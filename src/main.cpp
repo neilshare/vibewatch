@@ -13,6 +13,9 @@
 #include <string>
 
 #include "vibe_hid.h"
+#include "vibe_ingress.h"
+#include "vibe_approval.h"
+#include "vibe_protocol.h"
 #include "vibe_state.h"
 #include "sound.h"
 
@@ -104,15 +107,44 @@ NimBLEServer* g_server = nullptr;
 NimBLEHIDDevice* g_hid = nullptr;
 NimBLECharacteristic* g_vendorInput = nullptr;
 NimBLECharacteristic* g_vendorOutput = nullptr;
-QueueHandle_t g_rpcQueue = nullptr;
+NimBLECharacteristic* g_approvalResult = nullptr;
 
 volatile bool g_connected = false;
 volatile bool g_uiDirty = true;
 volatile bool g_pairingSuccessPending = false;
-String g_rxBuffer;
 
-constexpr char kQuotaServiceUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c01";
-constexpr char kQuotaWriteUuid[] = "7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c02";
+struct CallbackConnection {
+    volatile bool active{false};
+    volatile std::uint16_t connectionHandle{0};
+    volatile bool configurePending{false};
+};
+
+std::array<CallbackConnection, 3> g_callbackConnections{};
+
+struct ApprovalSubscription {
+    volatile bool active{false};
+    volatile std::uint16_t connectionHandle{0};
+};
+
+std::array<ApprovalSubscription, 3> g_approvalSubscriptions{};
+
+struct DisconnectFallback {
+    volatile bool active{false};
+    volatile std::uint16_t connectionHandle{0};
+};
+
+std::array<DisconnectFallback, 3> g_disconnectFallbacks{};
+
+struct ApprovalOverflowNotice {
+    volatile bool active{false};
+    volatile std::uint16_t connectionHandle{0};
+};
+
+std::array<ApprovalOverflowNotice, 3> g_approvalOverflowNotices{};
+volatile bool g_indicationStatusPending = false;
+volatile int g_indicationStatusCode = 0;
+
+vibe::HidRpcAssembler g_hidRpcAssembler;
 
 std::array<CardState, CARD_COUNT> g_cards = {{
     CardState("CODEX", 0x12D6B2, QuotaState(86.0f, 369286, 0, true)),
@@ -191,11 +223,29 @@ void vibrate(std::uint8_t strength = 120, std::uint32_t durationMs = 25);
 void playSe(float frequency = 880.0f, std::uint32_t durationMs = 35);
 
 ApprovalState g_approval;
+vibe::ApprovalController g_approvalController;
+std::uint16_t g_pendingApprovalConnection = 0;
+bool g_v2ApprovalActive = false;
+
+struct PendingIndication {
+    bool active{false};
+    std::uint16_t connectionHandle{0};
+    std::uint16_t length{0};
+    std::array<std::uint8_t, vibe::kIngressPayloadLength> payload{};
+    std::uint32_t deadlineMs{0};
+};
+
+PendingIndication g_pendingIndication;
+constexpr std::uint32_t kIndicationDeliveryTimeoutMs = 5000;
 
 constexpr std::uint32_t kApprovalSwitchCooldownMs = 4000;
 std::uint32_t g_lastApprovalSwitchedAtMs = 0;
 
 void applyApprovalRequest(JsonVariantConst params) {
+    if (g_approvalController.pending()) {
+        Serial.println("legacy approval rejected: busy");
+        return;
+    }
     if (params.isNull()) return;
     if (params.is<JsonObjectConst>()) {
         JsonObjectConst obj = params.as<JsonObjectConst>();
@@ -226,6 +276,7 @@ void applyApprovalRequest(JsonVariantConst params) {
         }
 
         g_currentCard = targetCard;
+        g_v2ApprovalActive = false;
         g_approval.active = true;
         g_approval.agentId = obj["agent"] | obj["agentId"] | 0;
         const char* t = obj["type"] | obj["t"] | "EXEC";
@@ -244,37 +295,6 @@ void applyApprovalRequest(JsonVariantConst params) {
                       g_cards[g_currentCard].name, g_approval.type, g_approval.summary);
     }
 }
-
-class QuotaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
-        const NimBLEAttValue value = characteristic->getValue();
-        const auto* data = value.data();
-        const std::size_t length = value.size();
-        if (data == nullptr || length == 0) return;
-
-        JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, data, length);
-        if (!err) {
-            if (doc.is<JsonObjectConst>()) {
-                JsonObjectConst root = doc.as<JsonObjectConst>();
-                const char* method = root["method"] | root["m"] | root["op"] | "";
-                if (std::strcmp(method, "v.oai.approval_req") == 0 ||
-                    std::strcmp(method, "approval") == 0 ||
-                    std::strcmp(method, "prompt") == 0) {
-                    JsonVariantConst p = root["params"];
-                    if (p.isNull()) p = root["p"];
-                    if (p.isNull()) p = doc.as<JsonVariantConst>();
-                    applyApprovalRequest(p);
-                    return;
-                }
-            }
-            applyQuotaStatus(doc.as<JsonVariantConst>());
-        } else {
-            Serial.printf("Quota JSON parse failed: %s\n", err.c_str());
-        }
-    }
-};
-QuotaCharacteristicCallbacks g_quotaCallbacks;
 
 // Input state is intentionally explicit because a physical-button press may
 // become a single action, a long press, or a two-button layer-switch chord.
@@ -495,7 +515,8 @@ void updateBattery(bool notify) {
 
 // Vendor JSON-RPC messages are split into fixed-size HID reports. Byte 0 is the
 // channel, byte 1 is the payload length, and bytes 2..62 contain UTF-8 JSON.
-void sendFramedJson(String payload, bool appendCrlf) {
+void sendFramedJson(String payload, bool appendCrlf,
+                    std::uint16_t connectionHandle) {
     if (!g_connected || g_vendorInput == nullptr) {
         return;
     }
@@ -511,8 +532,7 @@ void sendFramedJson(String payload, bool appendCrlf) {
         report[0] = vibe::kChannelJsonRpc;
         report[1] = static_cast<std::uint8_t>(chunk);
         std::memcpy(&report[2], payload.c_str() + offset, chunk);
-        g_vendorInput->setValue(report, sizeof(report));
-        if (!g_vendorInput->notify()) {
+        if (!g_vendorInput->notify(report, sizeof(report), connectionHandle)) {
             Serial.println("BLE notify failed");
             return;
         }
@@ -659,7 +679,8 @@ void applyFocusedApp(JsonVariantConst params) {
     g_uiDirty = true;
 }
 
-void sendRpcResponse(const char* method, int id) {
+void sendRpcResponse(const char* method, int id,
+                     std::uint16_t connectionHandle) {
     JsonDocument response;
     response["id"] = id;
     response["method"] = method;
@@ -680,13 +701,14 @@ void sendRpcResponse(const char* method, int id) {
 
     String json;
     serializeJson(response, json);
-    sendFramedJson(json, true);
+    sendFramedJson(json, true, connectionHandle);
     Serial.printf("RPC response: %s id=%d\n", method, id);
 }
 
-void processRpc(const char* json) {
+void processRpc(const std::uint8_t* json, std::size_t length,
+                std::uint16_t connectionHandle) {
     JsonDocument request;
-    const DeserializationError error = deserializeJson(request, json);
+    const DeserializationError error = deserializeJson(request, json, length);
     if (error) {
         Serial.printf("RPC parse failed: %s\n", error.c_str());
         return;
@@ -712,14 +734,438 @@ void processRpc(const char* json) {
     }
 
     if (id >= 0 && method[0] != '\0') {
-        sendRpcResponse(method, id);
+        sendRpcResponse(method, id, connectionHandle);
     }
 }
 
-// BLE output callbacks run on NimBLE's task. This class only validates and
-// reassembles frames, then queues a complete JSON message for the main loop.
+bool approvalIndicationsEnabled(std::uint16_t connectionHandle) {
+    for (const auto& subscription : g_approvalSubscriptions) {
+        if (subscription.active &&
+            subscription.connectionHandle == connectionHandle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void updateCallbackConnection(std::uint16_t connectionHandle, bool connected) {
+    for (auto& connection : g_callbackConnections) {
+        if (connection.active &&
+            connection.connectionHandle == connectionHandle) {
+            connection.active = connected;
+            connection.configurePending = connected;
+            return;
+        }
+    }
+    if (!connected) {
+        return;
+    }
+    for (auto& connection : g_callbackConnections) {
+        if (!connection.active) {
+            connection.connectionHandle = connectionHandle;
+            connection.configurePending = true;
+            connection.active = true;
+            return;
+        }
+    }
+}
+
+bool anyCallbackConnectionActive() {
+    for (const auto& connection : g_callbackConnections) {
+        if (connection.active) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool callbackConnectionActive(std::uint16_t connectionHandle) {
+    for (const auto& connection : g_callbackConnections) {
+        if (connection.active &&
+            connection.connectionHandle == connectionHandle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void updateApprovalSubscription(std::uint16_t connectionHandle,
+                                bool enabled) {
+    for (auto& subscription : g_approvalSubscriptions) {
+        if (subscription.active &&
+            subscription.connectionHandle == connectionHandle) {
+            subscription.active = enabled;
+            return;
+        }
+    }
+    if (!enabled) {
+        return;
+    }
+    for (auto& subscription : g_approvalSubscriptions) {
+        if (!subscription.active) {
+            subscription.connectionHandle = connectionHandle;
+            subscription.active = true;
+            return;
+        }
+    }
+}
+
+bool sendIndicationPayload(const std::uint8_t* payload, std::size_t length,
+                           std::uint16_t connectionHandle,
+                           std::uint32_t nowMs) {
+    if (g_approvalResult == nullptr || payload == nullptr || length == 0 ||
+        length > g_pendingIndication.payload.size() ||
+        g_pendingIndication.active) {
+        return false;
+    }
+
+    std::memcpy(g_pendingIndication.payload.data(), payload, length);
+    g_pendingIndication.connectionHandle = connectionHandle;
+    g_pendingIndication.length = static_cast<std::uint16_t>(length);
+    g_pendingIndication.deadlineMs = nowMs + kIndicationDeliveryTimeoutMs;
+    g_pendingIndication.active = true;
+    if (!g_approvalResult->indicate(g_pendingIndication.payload.data(), length,
+                                    connectionHandle)) {
+        g_pendingIndication = {};
+        return false;
+    }
+    return true;
+}
+
+bool queueApprovalDecision(const vibe::ApprovalDecisionV2& decision,
+                           std::uint16_t connectionHandle,
+                           std::uint32_t nowMs) {
+    char json[vibe::kIngressPayloadLength]{};
+    std::size_t written = 0;
+    if (!vibe::encodeApprovalDecision(decision, json, sizeof(json), written)) {
+        return false;
+    }
+    return sendIndicationPayload(
+        reinterpret_cast<const std::uint8_t*>(json), written,
+        connectionHandle, nowMs);
+}
+
+bool queueProtocolError(const char* requestId, vibe::ProtocolErrorCode code,
+                        const char* message, std::uint16_t connectionHandle,
+                        std::uint32_t nowMs) {
+    char json[vibe::kIngressPayloadLength]{};
+    std::size_t written = 0;
+    if (!vibe::encodeProtocolError(requestId, code, message, json,
+                                   sizeof(json), written)) {
+        return false;
+    }
+    return sendIndicationPayload(
+        reinterpret_cast<const std::uint8_t*>(json), written,
+        connectionHandle, nowMs);
+}
+
+void presentApprovalRequest(const vibe::ApprovalRequestV2& request,
+                            std::uint32_t nowMs) {
+    switch (request.card) {
+        case vibe::AgentCardId::Codex: g_currentCard = CARD_CODEX; break;
+        case vibe::AgentCardId::Workbuddy: g_currentCard = CARD_WORKBUDDY; break;
+        case vibe::AgentCardId::Antigravity: g_currentCard = CARD_ANTIGRAVITY; break;
+    }
+    g_v2ApprovalActive = true;
+    g_approval.active = true;
+    g_approval.agentId = request.agentId;
+    std::memcpy(g_approval.type, request.operationType,
+                sizeof(g_approval.type));
+    std::memcpy(g_approval.summary, request.summary,
+                sizeof(g_approval.summary));
+    g_approval.triggeredAtMs = nowMs;
+    g_lastApprovalSwitchedAtMs = nowMs;
+    noteActivity();
+    vibrate(250, 90);
+    playSe(1250.0f, 75);
+    g_uiDirty = true;
+    Serial.printf("approval accepted request_id=%.8s\n", request.requestId);
+}
+
+void decidePendingApproval(vibe::ApprovalChoice choice) {
+    if (g_pendingIndication.active) {
+        Serial.println("approval decision deferred: indication busy");
+        return;
+    }
+    const std::uint32_t nowMs = millis();
+    if (!callbackConnectionActive(g_pendingApprovalConnection)) {
+        const auto cancelled = g_approvalController.cancel(nowMs);
+        if (cancelled.hasValue) {
+            Serial.printf("approval cancelled before input request_id=%.8s\n",
+                          cancelled.value.requestId);
+        }
+        g_v2ApprovalActive = false;
+        g_approval.active = false;
+        g_pendingApprovalConnection = 0;
+        g_uiDirty = true;
+        return;
+    }
+    const auto expired = g_approvalController.expireIfNeeded(nowMs);
+    if (expired.hasValue) {
+        queueApprovalDecision(expired.value, g_pendingApprovalConnection,
+                              nowMs);
+        g_v2ApprovalActive = false;
+        g_approval.active = false;
+        g_pendingApprovalConnection = 0;
+        g_uiDirty = true;
+        return;
+    }
+    const auto decision = g_approvalController.decide(choice, nowMs);
+    if (!decision.hasValue) {
+        return;
+    }
+
+    if (!queueApprovalDecision(decision.value, g_pendingApprovalConnection,
+                               nowMs)) {
+        Serial.printf("approval decision transport_error request_id=%.8s\n",
+                      decision.value.requestId);
+    }
+    g_v2ApprovalActive = false;
+    g_approval.active = false;
+    g_pendingApprovalConnection = 0;
+    if (choice == vibe::ApprovalChoice::Approve) {
+        playSe(1350.0f, 60);
+        vibrate(180, 50);
+    } else {
+        playSe(450.0f, 60);
+        vibrate(120, 35);
+    }
+    g_uiDirty = true;
+}
+
+void expirePendingApproval(std::uint32_t nowMs) {
+    if (g_pendingIndication.active) {
+        return;
+    }
+    const auto expired = g_approvalController.expireIfNeeded(nowMs);
+    if (!expired.hasValue) {
+        return;
+    }
+    if (!queueApprovalDecision(expired.value, g_pendingApprovalConnection,
+                               nowMs)) {
+        Serial.printf("approval expired transport_error request_id=%.8s\n",
+                      expired.value.requestId);
+    }
+    g_v2ApprovalActive = false;
+    g_approval.active = false;
+    g_pendingApprovalConnection = 0;
+    g_uiDirty = true;
+}
+
+void processApprovalIngress(const vibe::IngressMessage& ingress,
+                            std::uint32_t nowMs) {
+    const auto decoded = vibe::decodeApprovalRequest(
+        ingress.payload.data(), ingress.length, true);
+    if (decoded.error != vibe::ProtocolError::None) {
+        const auto code = decoded.error == vibe::ProtocolError::UnsupportedVersion
+                              ? vibe::ProtocolErrorCode::UnsupportedVersion
+                              : vibe::ProtocolErrorCode::InvalidPayload;
+        if (!queueProtocolError("", code, "approval request rejected",
+                                ingress.connectionHandle, nowMs)) {
+            Serial.println("approval error delivery transport_error");
+        }
+        return;
+    }
+
+    if (decoded.legacy) {
+        JsonDocument document;
+        if (!deserializeJson(document, ingress.payload.data(), ingress.length)) {
+            applyApprovalRequest(document["params"]);
+        }
+        return;
+    }
+
+    if (!approvalIndicationsEnabled(ingress.connectionHandle)) {
+        if (!queueProtocolError(decoded.request.requestId,
+                                vibe::ProtocolErrorCode::TransportError,
+                                "approval indications are not enabled",
+                                ingress.connectionHandle, nowMs)) {
+            Serial.printf("approval transport_error request_id=%.8s\n",
+                          decoded.request.requestId);
+        }
+        return;
+    }
+
+    if (g_pendingIndication.active) {
+        Serial.printf("approval transport busy request_id=%.8s\n",
+                      decoded.request.requestId);
+        return;
+    }
+
+    const auto accepted = g_approvalController.accept(decoded.request, nowMs);
+    if (accepted == vibe::ApprovalAcceptResult::Busy) {
+        queueProtocolError(decoded.request.requestId,
+                           vibe::ProtocolErrorCode::Busy,
+                           "another request is pending",
+                           ingress.connectionHandle, nowMs);
+        return;
+    }
+    if (accepted == vibe::ApprovalAcceptResult::Duplicate) {
+        Serial.printf("approval duplicate request_id=%.8s\n",
+                      decoded.request.requestId);
+        return;
+    }
+
+    g_pendingApprovalConnection = ingress.connectionHandle;
+    presentApprovalRequest(decoded.request, nowMs);
+}
+
+void processIngressMessage(const vibe::IngressMessage& ingress,
+                           std::uint32_t nowMs) {
+    if (ingress.kind == vibe::IngressKind::Disconnect) {
+        g_hidRpcAssembler.clear(ingress.connectionHandle);
+        g_connected = anyCallbackConnectionActive();
+        g_activeTouch = -1;
+        g_uiDirty = true;
+        if (g_approvalController.pending() &&
+            g_pendingApprovalConnection == ingress.connectionHandle) {
+            const auto cancelled = g_approvalController.cancel(nowMs);
+            g_v2ApprovalActive = false;
+            g_approval.active = false;
+            g_pendingApprovalConnection = 0;
+            g_uiDirty = true;
+            if (cancelled.hasValue &&
+                !queueApprovalDecision(cancelled.value,
+                                       ingress.connectionHandle, nowMs)) {
+                Serial.printf("approval cancelled transport_error request_id=%.8s\n",
+                              cancelled.value.requestId);
+            }
+        }
+        NimBLEDevice::startAdvertising();
+        Serial.printf("BLE disconnected: handle=%u\n",
+                      ingress.connectionHandle);
+        return;
+    }
+
+    if (!callbackConnectionActive(ingress.connectionHandle)) {
+        return;
+    }
+
+    if (ingress.length == 0) {
+        return;
+    }
+    if (ingress.kind == vibe::IngressKind::Approval) {
+        processApprovalIngress(ingress, nowMs);
+        return;
+    }
+
+    JsonDocument document;
+    const DeserializationError error = deserializeJson(
+        document, ingress.payload.data(), ingress.length);
+    if (error) {
+        Serial.printf("quota invalid_payload: %s\n", error.c_str());
+        return;
+    }
+    applyQuotaStatus(document.as<JsonVariantConst>());
+}
+
+void processHidChunkInMainLoop(const vibe::HidChunk& chunk) {
+    if (!callbackConnectionActive(chunk.connectionHandle)) {
+        return;
+    }
+    vibe::HidRpcView completed{};
+    const auto result = g_hidRpcAssembler.consume(chunk, completed);
+    if (result == vibe::HidConsumeResult::Complete) {
+        processRpc(completed.data, completed.length,
+                   completed.connectionHandle);
+    } else if (result != vibe::HidConsumeResult::Incomplete) {
+        Serial.printf("HID RPC discarded: %u\n",
+                      static_cast<unsigned>(result));
+    }
+}
+
+void processIndicationTransport(std::uint32_t nowMs) {
+    if (g_indicationStatusPending) {
+        const int statusCode = g_indicationStatusCode;
+        g_indicationStatusPending = false;
+        if (g_pendingIndication.active) {
+            if (statusCode != BLE_HS_EDONE) {
+                Serial.printf("approval indication transport_error status=%d\n",
+                              statusCode);
+            }
+            g_pendingIndication = {};
+        }
+    }
+    if (g_pendingIndication.active &&
+        static_cast<std::int32_t>(nowMs - g_pendingIndication.deadlineMs) >= 0) {
+        Serial.println("approval indication transport_error timeout");
+        g_pendingIndication = {};
+    }
+}
+
+void processBleLifecycleEvents(std::uint32_t nowMs) {
+    bool connectionChanged = false;
+    for (auto& connection : g_callbackConnections) {
+        if (connection.active && connection.configurePending) {
+            const std::uint16_t connectionHandle =
+                connection.connectionHandle;
+            connection.configurePending = false;
+            if (g_server != nullptr) {
+                g_server->updateConnParams(connectionHandle, 12, 24, 0, 180);
+            }
+            connectionChanged = true;
+            Serial.printf("BLE connected: handle=%u\n", connectionHandle);
+        }
+    }
+    g_connected = anyCallbackConnectionActive();
+    if (connectionChanged) {
+        g_uiDirty = true;
+    }
+
+    for (auto& fallback : g_disconnectFallbacks) {
+        if (!fallback.active) {
+            continue;
+        }
+        const std::uint16_t connectionHandle = fallback.connectionHandle;
+        fallback.active = false;
+        vibe::IngressMessage disconnect{};
+        disconnect.kind = vibe::IngressKind::Disconnect;
+        disconnect.connectionHandle = connectionHandle;
+        processIngressMessage(disconnect, nowMs);
+        Serial.printf("disconnect queue_full fallback handle=%u\n",
+                      connectionHandle);
+    }
+
+    for (auto& overflow : g_approvalOverflowNotices) {
+        if (!overflow.active) {
+            continue;
+        }
+        const std::uint16_t connectionHandle = overflow.connectionHandle;
+        overflow.active = false;
+        if (!queueProtocolError("", vibe::ProtocolErrorCode::QueueFull,
+                                "approval ingress queue is full",
+                                connectionHandle, nowMs)) {
+            Serial.printf("approval queue_full handle=%u\n",
+                          connectionHandle);
+        }
+    }
+}
+
+void recordDisconnectFallback(std::uint16_t connectionHandle) {
+    for (auto& fallback : g_disconnectFallbacks) {
+        if (!fallback.active) {
+            fallback.connectionHandle = connectionHandle;
+            fallback.active = true;
+            return;
+        }
+    }
+}
+
+void recordApprovalOverflow(std::uint16_t connectionHandle) {
+    for (auto& overflow : g_approvalOverflowNotices) {
+        if (!overflow.active) {
+            overflow.connectionHandle = connectionHandle;
+            overflow.active = true;
+            return;
+        }
+    }
+}
+
+// BLE output callbacks only validate and copy fixed-size fragments. Completion
+// detection and JSON parsing happen in processHidChunkInMainLoop().
 class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
+    void onWrite(NimBLECharacteristic* characteristic,
+                 NimBLEConnInfo& connection) override {
         const NimBLEAttValue value = characteristic->getValue();
         const auto* data = value.data();
         const std::size_t length = value.size();
@@ -728,64 +1174,76 @@ class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
         }
 
         const std::size_t chunkLength = data[1];
-        if (chunkLength > vibe::kRpcChunkLength || chunkLength > length - 2) {
-            Serial.println("Invalid RPC chunk");
-            g_rxBuffer = "";
+        if (chunkLength == 0 || chunkLength > vibe::kRpcChunkLength ||
+            chunkLength > length - 2) {
             return;
         }
-        if (g_rxBuffer.length() + chunkLength > vibe::kRpcBufferLength) {
-            Serial.println("RPC request too large");
-            g_rxBuffer = "";
+        vibe::enqueueHidChunk(connection.getConnHandle(), data + 2,
+                              chunkLength);
+    }
+};
+
+class GattWriteCallbacks : public NimBLECharacteristicCallbacks {
+  public:
+    GattWriteCallbacks(vibe::IngressKind kind, bool requireBond)
+        : kind_(kind), requireBond_(requireBond) {}
+
+    void onWrite(NimBLECharacteristic* characteristic,
+                 NimBLEConnInfo& connection) override {
+        const bool encrypted = connection.isEncrypted();
+        const bool bonded = connection.isBonded();
+        if (!encrypted || (requireBond_ && !bonded)) {
+            if (requireBond_ && g_server != nullptr) {
+                g_server->disconnect(connection.getConnHandle());
+            }
             return;
         }
 
-        for (std::size_t i = 0; i < chunkLength; ++i) {
-            g_rxBuffer += static_cast<char>(data[i + 2]);
+        const NimBLEAttValue value = characteristic->getValue();
+        const auto result = vibe::enqueueGattWrite(
+            kind_, connection.getConnHandle(), value.data(), value.size(), true);
+        if (kind_ == vibe::IngressKind::Approval &&
+            result == vibe::EnqueueResult::QueueFull) {
+            recordApprovalOverflow(connection.getConnHandle());
         }
+    }
 
-        JsonDocument probe;
-        const DeserializationError parseResult = deserializeJson(probe, g_rxBuffer);
-        if (parseResult == DeserializationError::IncompleteInput) {
-            return;
-        }
-        if (parseResult) {
-            Serial.printf("Discarding malformed RPC: %s\n", parseResult.c_str());
-            g_rxBuffer = "";
-            return;
-        }
+  private:
+    vibe::IngressKind kind_;
+    bool requireBond_;
+};
 
-        auto* message = static_cast<char*>(std::malloc(g_rxBuffer.length() + 1));
-        if (message == nullptr) {
-            Serial.println("RPC allocation failed");
-            g_rxBuffer = "";
-            return;
-        }
-        std::memcpy(message, g_rxBuffer.c_str(), g_rxBuffer.length());
-        message[g_rxBuffer.length()] = '\0';
-        if (xQueueSend(g_rpcQueue, &message, 0) != pdTRUE) {
-            Serial.println("RPC queue full");
-            std::free(message);
-        }
-        g_rxBuffer = "";
+class ApprovalResultCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo& connection,
+                     std::uint16_t subscription) override {
+        updateApprovalSubscription(connection.getConnHandle(),
+                                   (subscription & 0x0002U) != 0);
+    }
+
+    void onStatus(NimBLECharacteristic*, int code) override {
+        g_indicationStatusCode = code;
+        g_indicationStatusPending = true;
     }
 };
 
 // Connection callbacks keep the UI synchronized with pairing state and resume
 // advertising automatically after a disconnect.
 class HidServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* server, NimBLEConnInfo& connection) override {
-        g_connected = true;
-        g_uiDirty = true;
-        server->updateConnParams(connection.getConnHandle(), 12, 24, 0, 180);
-        Serial.printf("BLE connected: %s\n", connection.getAddress().toString().c_str());
+    void onConnect(NimBLEServer*, NimBLEConnInfo& connection) override {
+        updateCallbackConnection(connection.getConnHandle(), true);
     }
 
-    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
-        g_connected = false;
-        g_activeTouch = -1;
-        g_uiDirty = true;
-        Serial.printf("BLE disconnected: %d\n", reason);
-        NimBLEDevice::startAdvertising();
+    void onDisconnect(NimBLEServer*, NimBLEConnInfo& connection,
+                      int reason) override {
+        const auto result = vibe::enqueueGattWrite(
+            vibe::IngressKind::Disconnect, connection.getConnHandle(),
+            nullptr, 0);
+        if (result != vibe::EnqueueResult::Accepted) {
+            recordDisconnectFallback(connection.getConnHandle());
+        }
+        updateCallbackConnection(connection.getConnHandle(), false);
+        updateApprovalSubscription(connection.getConnHandle(), false);
+        (void)reason;
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& connection) override {
@@ -802,6 +1260,9 @@ class HidServerCallbacks : public NimBLEServerCallbacks {
 };
 
 RpcOutputCallbacks g_rpcCallbacks;
+GattWriteCallbacks g_quotaCallbacks(vibe::IngressKind::Quota, false);
+GattWriteCallbacks g_approvalCallbacks(vibe::IngressKind::Approval, true);
+ApprovalResultCallbacks g_approvalResultCallbacks;
 HidServerCallbacks g_serverCallbacks;
 
 void addDeviceInfoCharacteristic(std::uint16_t uuid, const char* value) {
@@ -850,12 +1311,22 @@ void initializeBle() {
 
     updateBattery(false);
 
-    auto* quotaService = g_server->createService(kQuotaServiceUuid);
+    auto* quotaService = g_server->createService(vibe::kQuotaServiceUuid);
     auto* quotaCharacteristic = quotaService->createCharacteristic(
-        kQuotaWriteUuid,
-        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-    );
+        vibe::kQuotaWriteUuid,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC,
+        512);
     quotaCharacteristic->setCallbacks(&g_quotaCallbacks);
+    auto* approvalCharacteristic = quotaService->createCharacteristic(
+        vibe::kApprovalWriteUuid,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC,
+        512);
+    approvalCharacteristic->setCallbacks(&g_approvalCallbacks);
+    g_approvalResult = quotaService->createCharacteristic(
+        vibe::kApprovalResultUuid,
+        NIMBLE_PROPERTY::INDICATE | NIMBLE_PROPERTY::READ_ENC,
+        512);
+    g_approvalResult->setCallbacks(&g_approvalResultCallbacks);
 
     if (!g_server->start()) {
         Serial.println("Failed to start BLE GATT server");
@@ -866,7 +1337,7 @@ void initializeBle() {
     advertising->setName(g_deviceName);
     advertising->setAppearance(HID_KEYBOARD);
     advertising->addServiceUUID(g_hid->getHidService()->getUUID());
-    advertising->addServiceUUID(kQuotaServiceUuid);
+    advertising->addServiceUUID(vibe::kQuotaServiceUuid);
     advertising->enableScanResponse(true);
     advertising->start();
     Serial.printf("BLE HID advertising started as %s\n", g_deviceName);
@@ -1143,6 +1614,10 @@ void handleTouch() {
     if (g_approval.active) {
         if (touch.wasPressed()) {
             if (touch.x < kScreenCenter && touch.y > 270) { // Left / NG
+                if (g_v2ApprovalActive) {
+                    decidePendingApproval(vibe::ApprovalChoice::Reject);
+                    return;
+                }
                 g_approval.active = false;
                 sendOuterActionEvent(kNgAction, true);
                 delay(20);
@@ -1152,6 +1627,10 @@ void handleTouch() {
                 g_uiDirty = true;
                 return;
             } else if (touch.x >= kScreenCenter && touch.y > 270) { // Right / OK
+                if (g_v2ApprovalActive) {
+                    decidePendingApproval(vibe::ApprovalChoice::Approve);
+                    return;
+                }
                 g_approval.active = false;
                 sendOuterActionEvent(kOkAction, true);
                 delay(20);
@@ -1290,6 +1769,10 @@ void handlePhysicalButtons() {
 
     if (g_approval.active) {
         if (M5.BtnA.wasPressed()) { // Left physical button -> Reject
+            if (g_v2ApprovalActive) {
+                decidePendingApproval(vibe::ApprovalChoice::Reject);
+                return;
+            }
             g_approval.active = false;
             sendOuterActionEvent(kNgAction, true);
             delay(20);
@@ -1300,6 +1783,10 @@ void handlePhysicalButtons() {
             return;
         }
         if (M5.BtnB.wasPressed()) { // Right physical button -> Approve
+            if (g_v2ApprovalActive) {
+                decidePendingApproval(vibe::ApprovalChoice::Approve);
+                return;
+            }
             g_approval.active = false;
             sendOuterActionEvent(kOkAction, true);
             delay(20);
@@ -2430,9 +2917,8 @@ void setup() {
     showSplashScreen();
 
     initializeAgentPositions();
-    g_rpcQueue = xQueueCreate(6, sizeof(char*));
-    if (g_rpcQueue == nullptr) {
-        Serial.println("Failed to create RPC queue");
+    if (!vibe::initializeIngressQueue()) {
+        Serial.println("Failed to create ingress queues");
         while (true) {
             delay(1000);
         }
@@ -2447,15 +2933,24 @@ void loop() {
     // Keep input, host messages, deferred restart, haptics, battery updates, and
     // rendering cooperative; no path should block long enough to starve BLE.
     M5.update();
+    const std::uint32_t ingressNow = millis();
+    processBleLifecycleEvents(ingressNow);
+
+    vibe::IngressMessage ingress;
+    for (int processed = 0;
+         processed < 4 && vibe::dequeueIngress(ingress); ++processed) {
+        processIngressMessage(ingress, millis());
+    }
+    vibe::HidChunk chunk;
+    for (int processed = 0;
+         processed < 8 && vibe::dequeueHidChunk(chunk); ++processed) {
+        processHidChunkInMainLoop(chunk);
+    }
+
+    processIndicationTransport(ingressNow);
+    expirePendingApproval(ingressNow);
     handleTouch();
     handlePhysicalButtons();
-
-    char* message = nullptr;
-    while (xQueueReceive(g_rpcQueue, &message, 0) == pdTRUE) {
-        processRpc(message);
-        std::free(message);
-        message = nullptr;
-    }
 
     if (g_pairingSuccessPending) {
         g_pairingSuccessPending = false;
