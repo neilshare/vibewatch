@@ -213,6 +213,9 @@ struct ApprovalState {
 };
 ApprovalState g_approval;
 
+constexpr std::uint32_t kApprovalSwitchCooldownMs = 4000;
+std::uint32_t g_lastApprovalSwitchedAtMs = 0;
+
 void applyApprovalRequest(JsonVariantConst params) {
     if (params.isNull()) return;
     if (params.is<JsonObjectConst>()) {
@@ -223,23 +226,37 @@ void applyApprovalRequest(JsonVariantConst params) {
             g_uiDirty = true;
             return;
         }
+
+        const char* cardName = obj["card"] | obj["agent_system"] | "";
+        AgentCard targetCard = g_currentCard;
+        if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
+            targetCard = CARD_WORKBUDDY;
+        } else if (strcasecmp(cardName, "antigravity") == 0 || strcasecmp(cardName, "gravity") == 0) {
+            targetCard = CARD_ANTIGRAVITY;
+        } else if (strcasecmp(cardName, "codex") == 0) {
+            targetCard = CARD_CODEX;
+        }
+
+        const uint32_t now = millis();
+        // Protection Window: If an approval is active and user is interacting within cooldown,
+        // protect current modal and avoid flapping across cards
+        if (g_approval.active && (now - g_approval.triggeredAtMs < kApprovalSwitchCooldownMs) && targetCard != g_currentCard) {
+            Serial.printf("Approval request for [%s] throttled by active modal on [%s]\n",
+                          g_cards[targetCard].name, g_cards[g_currentCard].name);
+            return;
+        }
+
+        g_currentCard = targetCard;
         g_approval.active = true;
         g_approval.agentId = obj["agent"] | obj["agentId"] | 0;
         const char* t = obj["type"] | obj["t"] | "EXEC";
         const char* s = obj["summary"] | obj["desc"] | obj["s"] | "Run Command";
-        const char* cardName = obj["card"] | obj["agent_system"] | "";
-        if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
-            g_currentCard = CARD_WORKBUDDY;
-        } else if (strcasecmp(cardName, "antigravity") == 0 || strcasecmp(cardName, "gravity") == 0) {
-            g_currentCard = CARD_ANTIGRAVITY;
-        } else if (strcasecmp(cardName, "codex") == 0) {
-            g_currentCard = CARD_CODEX;
-        }
         std::strncpy(g_approval.type, t, sizeof(g_approval.type) - 1);
         g_approval.type[sizeof(g_approval.type) - 1] = '\0';
         std::strncpy(g_approval.summary, s, sizeof(g_approval.summary) - 1);
         g_approval.summary[sizeof(g_approval.summary) - 1] = '\0';
-        g_approval.triggeredAtMs = millis();
+        g_approval.triggeredAtMs = now;
+        g_lastApprovalSwitchedAtMs = now;
         noteActivity();
         vibrate(250, 90);
         playSe(1250.0f, 75);
@@ -445,7 +462,7 @@ bool uiIsAnimated() {
     if (g_selectionAnimating) {
         return true;
     }
-    for (const auto& state : g_agents) {
+    for (const auto& state : g_cards[g_currentCard].agents) {
         if (state.effect == 4 || state.effect == 6) {
             return true;
         }
@@ -515,13 +532,12 @@ void sendKeyEvent(const char* key, bool pressed) {
         return;
     }
 
-    // Match the working M5Core2 implementation byte-for-byte: one complete
-    // 63-byte vendor report with CRLF included in the payload length.
     std::uint8_t report[vibe::kBleReportLength] = {};
     report[0] = vibe::kChannelJsonRpc;
     const int written = std::snprintf(
         reinterpret_cast<char*>(&report[2]), vibe::kRpcChunkLength,
-        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u}}\r\n", key, pressed ? 1U : 0U);
+        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u,\"c\":\"%s\"}}\r\n",
+        key, pressed ? 1U : 0U, g_cards[g_currentCard].name);
     if (written < 0 || written >= static_cast<int>(vibe::kRpcChunkLength)) {
         Serial.println("HID event payload overflow");
         return;
@@ -532,7 +548,7 @@ void sendKeyEvent(const char* key, bool pressed) {
         Serial.printf("HID notify failed: %s\n", key);
         return;
     }
-    Serial.printf("HID %s %s len=%d\n", key, pressed ? "DOWN" : "UP", written);
+    Serial.printf("HID %s %s [%s] len=%d\n", key, pressed ? "DOWN" : "UP", g_cards[g_currentCard].name, written);
 }
 
 void sendAgentEvent(int index, bool pressed) {
@@ -573,14 +589,32 @@ void sendJoystickEvent(float angle, float distance) {
     Serial.printf("JOYSTICK angle=%.2f dist=%.2f\n", angle, distance);
 }
 
-// Apply the host's compact agent-state array directly to the six ring buttons.
+// Apply the host's compact agent-state array directly to the targeted card's six ring buttons.
 void applyAgentStatus(JsonVariantConst params) {
     noteActivity();
-    if (!params.is<JsonArrayConst>()) {
+    int targetCard = g_currentCard;
+    JsonArrayConst items;
+    if (params.is<JsonArrayConst>()) {
+        items = params.as<JsonArrayConst>();
+    } else if (params.is<JsonObjectConst>()) {
+        JsonObjectConst obj = params.as<JsonObjectConst>();
+        const char* cardName = obj["card"] | obj["agent_system"] | "";
+        if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
+            targetCard = CARD_WORKBUDDY;
+        } else if (strcasecmp(cardName, "antigravity") == 0 || strcasecmp(cardName, "gravity") == 0) {
+            targetCard = CARD_ANTIGRAVITY;
+        } else if (strcasecmp(cardName, "codex") == 0) {
+            targetCard = CARD_CODEX;
+        }
+        items = obj["agents"].as<JsonArrayConst>();
+    } else {
         return;
     }
+
+    if (items.isNull()) return;
+
     bool anyAgentChanged = false;
-    for (JsonObjectConst item : params.as<JsonArrayConst>()) {
+    for (JsonObjectConst item : items) {
         const int id = item["id"] | -1;
         if (id < 0 || id >= kAgentCount) {
             continue;
@@ -590,7 +624,7 @@ void applyAgentStatus(JsonVariantConst params) {
         next.brightness = item["b"] | 0.0f;
         next.effect = item["e"] | 0;
         next.speed = item["s"] | 0.0f;
-        auto& state = g_agents[id];
+        auto& state = g_cards[targetCard].agents[id];
         const bool changed = state.color != next.color ||
                              std::abs(state.brightness - next.brightness) > 0.001f ||
                              state.effect != next.effect ||
@@ -599,8 +633,6 @@ void applyAgentStatus(JsonVariantConst params) {
         state = next;
     }
 
-    // Agent-state changes use haptics only. One compact cue represents a host
-    // update even when several agents change together, with rapid updates throttled.
     const std::uint32_t now = millis();
     if (anyAgentChanged && g_agentStateVibeEnabled &&
         now - g_lastAgentVibrationAt >= 120) {
