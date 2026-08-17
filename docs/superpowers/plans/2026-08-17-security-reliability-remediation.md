@@ -36,8 +36,8 @@
 - `lib/vibe_core/src/vibe_quota.cpp` — quota validation and elapsed-time calculation.
 - `lib/vibe_core/src/vibe_ingress_core.h` — portable fixed-size ingress buffer and connection-scoped assembly interface.
 - `lib/vibe_core/src/vibe_ingress_core.cpp` — portable ingress capacity and reassembly implementation.
-- `include/vibe_ingress.h` — fixed-size FreeRTOS ingress message declaration and firmware queue API.
-- `src/vibe_ingress.cpp` — queue creation, push/pop, connection-scoped HID assembly, and NimBLE callback adapters.
+- `include/vibe_ingress.h` — separate fixed-size FreeRTOS control-message and HID-chunk queue declarations.
+- `src/vibe_ingress.cpp` — queue creation, push/pop, NimBLE callback adapters, and main-loop-owned connection-scoped HID assembly.
 - `test/test_vibe_core/test_main.cpp` — native approval, protocol, quota, and UTF-8 tests.
 
 ### Swift files
@@ -305,7 +305,7 @@ git commit -m "feat: add transactional approval core"
 
 - [ ] **Step 1: Write failing queue and connection-isolation tests**
 
-Add native tests for a platform-neutral `IngressBuffer` helper: six pushes succeed, the seventh returns `QueueFull`, FIFO order is preserved, a 513-byte message returns `PayloadTooLarge`, and chunks from connection handles `1` and `2` never share an assembly buffer.
+Add native tests for a platform-neutral `IngressBuffer<6, 512>` control helper: six pushes succeed, the seventh returns `QueueFull`, FIFO order is preserved, and a 513-byte message returns `PayloadTooLarge`. Add `HidRpcAssembler` tests proving that chunks from connection handles `1` and `2` never share a buffer and that JSON completion is detected only when parsing occurs in the main-loop-facing `consume()` method.
 
 Run: `./.venv/bin/platformio test -e native`
 
@@ -316,17 +316,22 @@ Expected: FAIL because `vibe_ingress_core.h` and `IngressBuffer` do not exist.
 Create a portable helper in `lib/vibe_core/src/vibe_ingress_core.h/.cpp` and the FreeRTOS adapter in `include/vibe_ingress.h`:
 
 ```cpp
-enum class IngressKind : std::uint8_t { HidRpc, Quota, Approval, Disconnect };
+enum class IngressKind : std::uint8_t { Quota, Approval, Disconnect };
 struct IngressMessage {
     IngressKind kind{IngressKind::Quota};
     std::uint16_t connectionHandle{0};
     std::uint16_t length{0};
     std::array<std::uint8_t, 512> payload{};
 };
+struct HidChunk {
+    std::uint16_t connectionHandle{0};
+    std::uint8_t length{0};
+    std::array<std::uint8_t, 61> payload{};
+};
 enum class EnqueueResult : std::uint8_t { Accepted, PayloadTooLarge, QueueFull, Unauthorized };
 ```
 
-`src/vibe_ingress.cpp` owns the `QueueHandle_t`; callbacks receive a pointer/reference to it but no callback performs `malloc`, `String` concatenation, JSON parsing, or hardware calls.
+`src/vibe_ingress.cpp` owns a six-entry 512-byte control queue and a twelve-entry 61-byte HID-chunk queue. Callbacks receive queue references but no callback performs `malloc`, `String` concatenation, JSON parsing, message-completion detection, or hardware calls. `HidRpcAssembler` is called only by the Arduino main loop and keeps one bounded 2,048-byte assembly buffer per active connection handle.
 
 - [ ] **Step 3: Replace the mixed writable characteristic with three permission-specific characteristics**
 
@@ -360,22 +365,26 @@ Do not include `WRITE_NR` on quota or approval. In the approval callback, requir
 
 - [ ] **Step 4: Route every callback through the queue**
 
-Replace `QuotaCharacteristicCallbacks` and direct `applyApprovalRequest` calls. `onWrite` chooses only a message kind, verifies length/security, copies the bytes, and calls `xQueueSend(..., 0)`. Refactor HID reassembly so the completed JSON is copied into the same fixed ingress shape; remove `g_rxBuffer` and all callback-side `malloc/free`.
+Replace `QuotaCharacteristicCallbacks` and direct `applyApprovalRequest` calls. `onWrite` chooses only a control-message kind, verifies length/security, copies the bytes, and calls `xQueueSend(..., 0)`. The HID callback validates channel/chunk length, copies one raw fragment into `HidChunk`, and enqueues it without trying to identify message completion. Remove `g_rxBuffer` and all callback-side `malloc/free`.
 
 Add a disconnect ingress event before clearing the connection so a matching pending approval can become `cancelled` in the main loop.
 
 - [ ] **Step 5: Process a bounded number of messages in `loop()`**
 
-Replace the unbounded receive loop with a maximum of four messages per iteration:
+Drain at most four control messages and eight HID chunks per iteration:
 
 ```cpp
 vibe::IngressMessage ingress;
 for (int processed = 0; processed < 4 && dequeueIngress(ingress); ++processed) {
     processIngressMessage(ingress, millis());
 }
+vibe::HidChunk chunk;
+for (int processed = 0; processed < 8 && dequeueHidChunk(chunk); ++processed) {
+    processHidChunkInMainLoop(chunk);
+}
 ```
 
-`processIngressMessage` performs JSON parsing and invokes the existing quota/RPC behavior or Task 1's approval controller. An `Approval` message is classified as v2 or legacy only here, never in the callback. Only this function may call `noteActivity`, `playSe`, `vibrate`, or mutate UI state in response to BLE.
+`processIngressMessage` performs control-message JSON parsing and invokes quota behavior or Task 1's approval controller. An `Approval` message is classified as v2 or legacy only here, never in the callback. `processHidChunkInMainLoop` feeds the connection-scoped assembler and calls `processRpc` only when main-loop parsing reports a complete JSON document. Only these main-loop functions may call `noteActivity`, `playSe`, `vibrate`, or mutate UI state in response to BLE.
 
 - [ ] **Step 6: Send decisions as connection-targeted indications**
 
@@ -386,7 +395,7 @@ g_approvalResult->indicate(
     reinterpret_cast<const std::uint8_t*>(json), written, pendingConnectionHandle);
 ```
 
-Track `onSubscribe` for the connection handle. Reject a new approval with a protocol error if that peer has not enabled indications. Handle `onStatus` to clear the transient `decided` delivery state; bound delivery to five seconds and log `transport_error` on timeout.
+Track `onSubscribe` for the connection handle. Reject a new approval with a protocol error if that peer has not enabled indications. Extend `vibe_protocol` with a tested `encodeProtocolError()` that emits `{"version":2,"kind":"error","request_id":"<canonical UUID or empty string>","code":"<stable code>","message":"<bounded message>"}`. The BLE transport layer, not `ApprovalController`, owns a single `PendingIndication` containing connection handle, fixed payload, payload length, and five-second deadline. Handle `onStatus` to clear this transport state; timeout logs and clears `transport_error` without reopening or approving the domain request.
 
 - [ ] **Step 7: Verify tests and firmware build**
 
