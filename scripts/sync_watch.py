@@ -67,7 +67,7 @@ def get_codex_rate_limits(codex_bin: str = "codex") -> Tuple[Optional[float], Op
     return None, None
 
 
-def sync_via_native_companion(demo: bool = False, verbose: bool = False) -> bool:
+def sync_via_native_companion(demo: bool = False, card: Optional[str] = None, verbose: bool = False) -> bool:
     """使用已编译的原生 macOS CoreBluetooth 驱动写入（支持已配对/已连接状态）"""
     bin_path = COMPANION_BIN
     if not bin_path.exists():
@@ -76,6 +76,8 @@ def sync_via_native_companion(demo: bool = False, verbose: bool = False) -> bool
     cmd = [str(bin_path)]
     if demo:
         cmd.append("--demo")
+    if card:
+        cmd.extend(["--card", card])
     if verbose:
         cmd.append("-v")
 
@@ -83,12 +85,14 @@ def sync_via_native_companion(demo: bool = False, verbose: bool = False) -> bool
     return result.returncode == 0
 
 
-def send_approval_native(req_type: str, summary: str, verbose: bool = False) -> bool:
+def send_approval_native(req_type: str, summary: str, card: Optional[str] = None, verbose: bool = False) -> bool:
     bin_path = COMPANION_BIN
     if not bin_path.exists():
         subprocess.run(["swift", "build"], cwd=str(PROJECT_ROOT / "companion"), check=True)
 
     cmd = [str(bin_path), "--approval", "--type", req_type, "--summary", summary]
+    if card:
+        cmd.extend(["--card", card])
     if verbose:
         cmd.append("-v")
 
@@ -96,9 +100,9 @@ def send_approval_native(req_type: str, summary: str, verbose: bool = False) -> 
     return result.returncode == 0
 
 
-async def send_approval_request(req_type: str, summary: str, active: bool = True, verbose: bool = False):
+async def send_approval_request(req_type: str, summary: str, active: bool = True, card: Optional[str] = None, verbose: bool = False):
     try:
-        if send_approval_native(req_type, summary, verbose):
+        if send_approval_native(req_type, summary, card, verbose):
             return True
     except Exception as e:
         if verbose:
@@ -173,6 +177,7 @@ def main():
     parser.add_argument("--remaining", type=float, default=None, help="剩余额度百分比 (0-100)")
     parser.add_argument("--reset", type=int, default=None, help="重置倒计时（秒）")
     parser.add_argument("--auto", action="store_true", help="自动从本地 Codex 会话读取额度")
+    parser.add_argument("--card", "--agent", type=str, default=None, help="目标系统卡片 (codex, workbuddy, antigravity)")
     parser.add_argument("--demo", action="store_true", help="发送模拟测试额度数据")
     parser.add_argument("--approval", action="store_true", help="触发人工介入确认卡片")
     parser.add_argument("--type", type=str, default="EXEC", help="确认操作类型 (例如 EXEC, WRITE, SCRIPT)")
@@ -181,12 +186,12 @@ def main():
     args = parser.parse_args()
 
     if args.approval:
-        success = asyncio.run(send_approval_request(args.type, args.summary, active=True))
+        success = asyncio.run(send_approval_request(args.type, args.summary, active=True, card=args.card, verbose=args.verbose))
         sys.exit(0 if success else 1)
 
     # Priority 1: Use native CoreBluetooth tool (handles connected HID keyboard flawlessly)
     try:
-        if sync_via_native_companion(demo=args.demo, verbose=args.verbose):
+        if sync_via_native_companion(demo=args.demo, card=args.card, verbose=args.verbose):
             return
     except Exception as e:
         if args.verbose:

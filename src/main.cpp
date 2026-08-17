@@ -121,8 +121,37 @@ struct QuotaState {
     std::uint32_t resetInSeconds = 0;
     std::uint32_t receivedAtMs = 0;
     bool available = false;
+
+    QuotaState() = default;
+    QuotaState(float rem, std::uint32_t resetSec, std::uint32_t recAt = 0, bool avail = true)
+        : remainingPercent(rem), resetInSeconds(resetSec), receivedAtMs(recAt), available(avail) {}
 };
-QuotaState g_quota;
+
+enum AgentCard : std::uint8_t {
+    CARD_CODEX = 0,
+    CARD_WORKBUDDY = 1,
+    CARD_ANTIGRAVITY = 2,
+    CARD_COUNT = 3
+};
+
+struct CardState {
+    const char* name;
+    std::uint32_t primaryColor;
+    QuotaState quota;
+    std::array<AgentState, kAgentCount> agents;
+    int selectedAgent;
+
+    CardState(const char* n, std::uint32_t c, QuotaState q, int sel = 0)
+        : name(n), primaryColor(c), quota(q), selectedAgent(sel) {}
+};
+
+std::array<CardState, CARD_COUNT> g_cards = {{
+    CardState("CODEX", 0x12D6B2, QuotaState(86.0f, 369286, 0, true)),
+    CardState("WORKBUDDY", 0x00E5FF, QuotaState(92.0f, 66600, 0, true)),
+    CardState("ANTIGRAVITY", 0x9D74FF, QuotaState(78.0f, 198000, 0, true))
+}};
+
+AgentCard g_currentCard = CARD_CODEX;
 constexpr std::uint32_t kQuotaStaleAfterMs = 180000;
 
 void formatResetCountdown(std::uint32_t seconds, char* buffer, std::size_t len) {
@@ -146,18 +175,28 @@ void applyQuotaStatus(JsonVariantConst params) {
     if (params.isNull()) return;
     float remaining = -1.0f;
     std::uint32_t resetSec = 0;
+    int targetCard = g_currentCard;
     if (params.is<JsonObjectConst>()) {
         JsonObjectConst obj = params.as<JsonObjectConst>();
         remaining = obj["remaining_percent"] | obj["remainingPercent"] | -1.0f;
         resetSec = obj["reset_in_seconds"] | obj["resetInSeconds"] | 0U;
+        const char* cardName = obj["card"] | obj["agent"] | "";
+        if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
+            targetCard = CARD_WORKBUDDY;
+        } else if (strcasecmp(cardName, "antigravity") == 0 || strcasecmp(cardName, "gravity") == 0) {
+            targetCard = CARD_ANTIGRAVITY;
+        } else if (strcasecmp(cardName, "codex") == 0) {
+            targetCard = CARD_CODEX;
+        }
     }
     if (remaining >= 0.0f && remaining <= 100.0f) {
-        g_quota.remainingPercent = remaining;
-        g_quota.resetInSeconds = resetSec;
-        g_quota.receivedAtMs = millis();
-        g_quota.available = true;
+        g_cards[targetCard].quota.remainingPercent = remaining;
+        g_cards[targetCard].quota.resetInSeconds = resetSec;
+        g_cards[targetCard].quota.receivedAtMs = millis();
+        g_cards[targetCard].quota.available = true;
         g_uiDirty = true;
-        Serial.printf("Quota update received: %.1f%% resetIn=%us\n", remaining, resetSec);
+        Serial.printf("Quota update for %s: %.1f%% resetIn=%us\n",
+                      g_cards[targetCard].name, remaining, resetSec);
     }
 }
 
@@ -188,6 +227,14 @@ void applyApprovalRequest(JsonVariantConst params) {
         g_approval.agentId = obj["agent"] | obj["agentId"] | 0;
         const char* t = obj["type"] | obj["t"] | "EXEC";
         const char* s = obj["summary"] | obj["desc"] | obj["s"] | "Run Command";
+        const char* cardName = obj["card"] | obj["agent_system"] | "";
+        if (strcasecmp(cardName, "workbuddy") == 0 || strcasecmp(cardName, "buddy") == 0) {
+            g_currentCard = CARD_WORKBUDDY;
+        } else if (strcasecmp(cardName, "antigravity") == 0 || strcasecmp(cardName, "gravity") == 0) {
+            g_currentCard = CARD_ANTIGRAVITY;
+        } else if (strcasecmp(cardName, "codex") == 0) {
+            g_currentCard = CARD_CODEX;
+        }
         std::strncpy(g_approval.type, t, sizeof(g_approval.type) - 1);
         g_approval.type[sizeof(g_approval.type) - 1] = '\0';
         std::strncpy(g_approval.summary, s, sizeof(g_approval.summary) - 1);
@@ -197,7 +244,8 @@ void applyApprovalRequest(JsonVariantConst params) {
         vibrate(250, 90);
         playSe(1250.0f, 75);
         g_uiDirty = true;
-        Serial.printf("Approval request received: type=%s summary=%s\n", g_approval.type, g_approval.summary);
+        Serial.printf("Approval request for [%s]: type=%s summary=%s\n",
+                      g_cards[g_currentCard].name, g_approval.type, g_approval.summary);
     }
 }
 
@@ -1132,14 +1180,6 @@ void handleTouch() {
         const int dx = touch.x - g_touchStartX;
         const int dy = touch.y - g_touchStartY;
         if (dx * dx + dy * dy >= kSwipeThresholdPx * kSwipeThresholdPx) {
-            float angle = 0.0f;
-            if (std::abs(dx) >= std::abs(dy)) {
-                g_activeSwipe = dx > 0 ? 1 : 3; // RIGHT or LEFT
-                angle = dx > 0 ? 0.00f : 0.50f;
-            } else {
-                g_activeSwipe = dy > 0 ? 2 : 0; // DOWN or UP
-                angle = dy > 0 ? 0.25f : 0.75f;
-            }
             // Cancel any button press that was initiated before swipe
             if (g_activeTouch == kTouchMic) {
                 sendMicEvent(false);
@@ -1152,10 +1192,31 @@ void handleTouch() {
                 }
             }
             g_activeTouch = -1;
-            sendJoystickEvent(angle, 1.0f);
-            vibrate(180, 40);
-            playSe(980.0f, 30);
-            g_uiDirty = true;
+
+            if (std::abs(dx) > std::abs(dy)) {
+                // Horizontal Swipe -> Card Navigation across Codex / Workbuddy / Antigravity
+                if (dx < 0) {
+                    // Swipe Left -> Next Card
+                    g_currentCard = static_cast<AgentCard>((g_currentCard + 1) % CARD_COUNT);
+                } else {
+                    // Swipe Right -> Prev Card
+                    g_currentCard = static_cast<AgentCard>((g_currentCard + CARD_COUNT - 1) % CARD_COUNT);
+                }
+                g_activeSwipe = dx > 0 ? 1 : 3;
+                playSe(1150.0f, 35);
+                vibrate(100, 30);
+                g_uiDirty = true;
+                return;
+            } else {
+                // Vertical Swipe -> Joystick Up / Down
+                g_activeSwipe = dy > 0 ? 2 : 0;
+                const float angle = dy > 0 ? 0.25f : 0.75f;
+                sendJoystickEvent(angle, 1.0f);
+                vibrate(120, 30);
+                playSe(880.0f, 25);
+                g_uiDirty = true;
+                return;
+            }
         }
     }
 
@@ -1497,6 +1558,32 @@ void drawAssistantGlyph(int x, int y, std::uint16_t color) {
     M5.Display.fillCircle(x + 7, y + 7, 2, color);
 }
 
+void drawCardHeader() {
+    if (g_actionLayer) return;
+    const auto& card = g_cards[g_currentCard];
+    const auto cardColor = scaledColor(card.primaryColor, 1.0f);
+
+    // 3 Pagination dots at y = 22
+    constexpr int dotRadius = 4;
+    constexpr int dotSpacing = 16;
+    constexpr int dotsStartX = kScreenCenter - dotSpacing;
+    for (int i = 0; i < CARD_COUNT; ++i) {
+        const int dx = dotsStartX + i * dotSpacing;
+        if (i == g_currentCard) {
+            M5.Display.fillCircle(dx, 22, dotRadius + 1, cardColor);
+        } else {
+            M5.Display.fillCircle(dx, 22, dotRadius - 1, M5.Display.color565(75, 80, 95));
+        }
+    }
+
+    // Card Name Pill at y = 44
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
+    M5.Display.setTextSize(0.50f);
+    M5.Display.setTextColor(cardColor, TFT_BLACK);
+    M5.Display.drawString(card.name, kScreenCenter, 44);
+}
+
 void drawPhysicalActionLinks() {
     // Colored rails enter from the real button positions at the top edge and
     // terminate under the OK/NG circles. Pressing either side lights its rail.
@@ -1706,13 +1793,14 @@ void renderSettingsUi() {
         M5.Display.setFont(&fonts::efontCN_16);
         M5.Display.setTextSize(1.0f);
         M5.Display.setTextColor(muted, TFT_BLACK);
-        if (g_quota.available) {
+        const auto& quota = g_cards[g_currentCard].quota;
+        if (quota.available) {
             char resetStr[24];
-            const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
-            const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
             formatResetCountdown(remSec, resetStr, sizeof(resetStr));
             char quotaLine[48];
-            std::snprintf(quotaLine, sizeof(quotaLine), "QUOTA: %.0f%% (%s)", g_quota.remainingPercent, resetStr);
+            std::snprintf(quotaLine, sizeof(quotaLine), "%s: %.0f%% (%s)", g_cards[g_currentCard].name, quota.remainingPercent, resetStr);
             M5.Display.drawString(quotaLine, kScreenCenter, 72);
         } else {
             M5.Display.drawString("蓝牙设备槽位", kScreenCenter, 72);
@@ -1726,13 +1814,14 @@ void renderSettingsUi() {
         M5.Display.setFont(&fonts::DejaVu18);
         M5.Display.setTextSize(0.78f);
         M5.Display.setTextColor(muted, TFT_BLACK);
-        if (g_quota.available) {
+        const auto& quota = g_cards[g_currentCard].quota;
+        if (quota.available) {
             char resetStr[24];
-            const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
-            const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
             formatResetCountdown(remSec, resetStr, sizeof(resetStr));
             char quotaLine[48];
-            std::snprintf(quotaLine, sizeof(quotaLine), "QUOTA: %.0f%% (%s)", g_quota.remainingPercent, resetStr);
+            std::snprintf(quotaLine, sizeof(quotaLine), "%s: %.0f%% (%s)", g_cards[g_currentCard].name, quota.remainingPercent, resetStr);
             M5.Display.drawString(quotaLine, kScreenCenter, 72);
         } else {
             M5.Display.drawString("BLUETOOTH DEVICE", kScreenCenter, 72);
@@ -1907,6 +1996,12 @@ void renderUi(std::uint32_t now) {
     if (g_actionLayer) {
         drawPhysicalActionLinks();
     }
+    // Draw current card header & pagination
+    drawCardHeader();
+
+    const auto& currentCard = g_cards[g_currentCard];
+    const auto currentPrimaryColor = scaledColor(currentCard.primaryColor, 1.0f);
+
     for (int i = 0; i < outerCount; ++i) {
         const int outerX = g_actionLayer ? actionX[i] : agentX[i];
         const int outerY = g_actionLayer ? actionY[i] : agentY[i];
@@ -1921,15 +2016,13 @@ void renderUi(std::uint32_t now) {
             accent = scaledColor(kActionColors[i], 1.0f);
             selected = i == 3 ? g_planModeEnabled : g_selectedAction == i;
         } else {
-            const auto& state = g_agents[i];
+            const auto& state = currentCard.agents[i];
             const float brightness = effectBrightness(state.effect, state.brightness, state.speed, now);
             fill = state.effect == 0 || state.color == 0
                        ? M5.Display.color565(17, 22, 28)
                        : scaledColor(state.color, brightness);
-            // Agent selection is rendered by one independently animated ring
-            // after all six circles have been painted.
             selected = false;
-            accent = M5.Display.color565(163, 132, 255);
+            accent = currentPrimaryColor;
         }
         const bool pressed = g_activeTouch == i || g_leftAgentPressed == i ||
                              (g_actionLayer && g_rightActionPressed && i == kOkAction);
@@ -1938,8 +2031,6 @@ void renderUi(std::uint32_t now) {
         }
         M5.Display.fillCircle(outerX, outerY, kAgentButtonRadius, fill);
         if (selected) {
-            // A three-stage edge stays visible against both dark and bright
-            // agent colors: outer glow, saturated edge, then white keyline.
             drawThickCircle(outerX, outerY, kAgentButtonRadius + 4, 3,
                             g_actionLayer ? scaledColor(0x34303F, 1.0f)
                                           : M5.Display.color565(74, 56, 128));
@@ -1998,8 +2089,6 @@ void renderUi(std::uint32_t now) {
             M5.Display.setTextColor(labelColor);
             char label[2];
             std::snprintf(label, sizeof(label), "%d", i + 1);
-            // Slight horizontal overdraw gives the angular Orbitron glyphs
-            // more weight without losing their technical character.
             M5.Display.drawString(label, outerX - 1, outerY);
             M5.Display.drawString(label, outerX + 1, outerY);
             M5.Display.drawString(label, outerX, outerY);
@@ -2010,18 +2099,19 @@ void renderUi(std::uint32_t now) {
         drawSelectionIndicator(now);
     }
 
-    // Draw Quota orbital gauge ring if available
-    const bool quotaStale = g_quota.available && (now - g_quota.receivedAtMs > kQuotaStaleAfterMs);
-    if (g_quota.available && !g_actionLayer) {
+    // Draw Quota orbital gauge ring for active card
+    const auto& quota = currentCard.quota;
+    const bool quotaStale = quota.available && (now - quota.receivedAtMs > kQuotaStaleAfterMs);
+    if (quota.available && !g_actionLayer) {
         constexpr int kQuotaOuterR = 82;
         constexpr int kQuotaInnerR = 76;
         const auto trackColor = M5.Display.color565(38, 50, 61);
         M5.Display.fillArc(kScreenCenter, kScreenCenter, kQuotaOuterR, kQuotaInnerR, 0, 360, trackColor);
 
-        const float remaining = std::max(0.0f, std::min(100.0f, g_quota.remainingPercent));
+        const float remaining = std::max(0.0f, std::min(100.0f, quota.remainingPercent));
         const auto quotaColor = quotaStale
             ? M5.Display.color565(116, 85, 39)
-            : (remaining > 20.0f ? M5.Display.color565(18, 214, 178) : M5.Display.color565(255, 180, 74));
+            : (remaining > 20.0f ? currentPrimaryColor : M5.Display.color565(255, 180, 74));
 
         M5.Display.fillArc(kScreenCenter, kScreenCenter, kQuotaOuterR, kQuotaInnerR, 0,
                            static_cast<int>(remaining * 3.6f), quotaColor);
@@ -2034,25 +2124,25 @@ void renderUi(std::uint32_t now) {
     }
 
     const bool micPressed = g_rightLongTriggered || g_activeTouch == kTouchMic;
-    const auto micAccent = M5.Display.color565(48, 79, 254);
+    const auto micAccent = currentPrimaryColor;
     const auto micFill = micPressed ? micAccent : M5.Display.color565(25, 31, 40);
     M5.Display.fillCircle(kScreenCenter, kScreenCenter, kMicButtonRadius, micFill);
     drawThickCircle(kScreenCenter, kScreenCenter, kMicButtonRadius, micPressed ? 7 : 4,
                     micPressed ? TFT_WHITE : micAccent);
 
-    if (g_quota.available && !micPressed && !g_actionLayer) {
-        const auto textColor = quotaStale ? M5.Display.color565(180, 150, 100) : M5.Display.color565(18, 214, 178);
+    if (quota.available && !micPressed && !g_actionLayer) {
+        const auto textColor = quotaStale ? M5.Display.color565(180, 150, 100) : currentPrimaryColor;
         const auto mutedColor = M5.Display.color565(130, 142, 160);
 
-        // Top line: Pure technical label "WEEKLY"
+        // Top line: Pure technical label e.g. "WEEKLY"
         M5.Display.setFont(&fonts::Orbitron_Light_24);
         M5.Display.setTextSize(0.48f);
         M5.Display.setTextColor(mutedColor, micFill);
         M5.Display.drawString(quotaStale ? "SYNC STALE" : "WEEKLY", kScreenCenter, kScreenCenter - 34);
 
-        // Center line: Crisp percentage "59%"
+        // Center line: Crisp percentage
         char quotaText[16];
-        std::snprintf(quotaText, sizeof(quotaText), "%.0f%%", g_quota.remainingPercent);
+        std::snprintf(quotaText, sizeof(quotaText), "%.0f%%", quota.remainingPercent);
         M5.Display.setFont(&fonts::Orbitron_Light_32);
         M5.Display.setTextSize(0.85f);
         M5.Display.setTextColor(textColor, micFill);
@@ -2060,8 +2150,8 @@ void renderUi(std::uint32_t now) {
 
         // Bottom line: Minimal concise countdown e.g. "RESET 1H 00M"
         char resetStr[24];
-        const std::uint32_t elapsed = (millis() - g_quota.receivedAtMs) / 1000;
-        const std::uint32_t remSec = elapsed >= g_quota.resetInSeconds ? 0 : g_quota.resetInSeconds - elapsed;
+        const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+        const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
         formatResetCountdown(remSec, resetStr, sizeof(resetStr));
 
         M5.Display.setFont(&fonts::Orbitron_Light_24);
@@ -2321,7 +2411,7 @@ void loop() {
     }
     const std::uint32_t uiPeriod = g_selectionAnimating ? kSelectionAnimationPeriodMs
                                                         : kUiAnimationPeriodMs;
-    const bool shouldRedrawQuota = g_quota.available && (now - g_lastUiDraw >= 1000);
+    const bool shouldRedrawQuota = g_cards[g_currentCard].quota.available && (now - g_lastUiDraw >= 1000);
     if (!g_isScreenSleeping && (g_uiDirty || uiIsAnimated() || shouldRedrawQuota) && now - g_lastUiDraw >= uiPeriod) {
         renderUi(now);
     }

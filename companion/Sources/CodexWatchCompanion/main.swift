@@ -10,10 +10,12 @@ private let hidServiceUUID = CBUUID(string: "1812")
 private struct QuotaSnapshot: Codable {
     let remainingPercent: Double
     let resetInSeconds: Int
+    var card: String?
 
     enum CodingKeys: String, CodingKey {
         case remainingPercent = "remaining_percent"
         case resetInSeconds = "reset_in_seconds"
+        case card = "card"
     }
 }
 
@@ -510,6 +512,7 @@ private struct Options {
     var approval = false
     var approvalType = "EXEC"
     var approvalSummary = "Run Command"
+    var card: String?
 }
 
 private func executableInPath(named executable: String) -> String? {
@@ -555,6 +558,10 @@ private func parseOptions() throws -> Options {
             options.codexPath = arguments[index]
         case "--demo":
             options.demo = true
+        case "--card", "--agent":
+            index += 1
+            guard index < arguments.count else { throw CompanionError.usage("--card 需要系统名称 (codex, workbuddy, antigravity)") }
+            options.card = arguments[index]
         case "--approval":
             options.approval = true
         case "--type":
@@ -587,8 +594,9 @@ private func parseOptions() throws -> Options {
             options.verbose = true
         case "--help", "-h":
             print("""
-            用法: codex-watch-companion [--watch] [--interval 60] [--approval --type EXEC --summary "..."] [-v]
+            用法: codex-watch-companion [--card codex|workbuddy|antigravity] [--watch] [--interval 60] [-v]
 
+              --card NAME      目标卡片/智能体 (codex, workbuddy, antigravity)
               --watch          持续刷新；默认只写入一次
               --interval N     额度刷新间隔，至少 10 秒，默认 60
               --demo           使用合成额度，不启动 Codex App Server
@@ -633,16 +641,17 @@ private func run() throws {
                 let active: Bool
                 let type: String
                 let summary: String
+                let card: String?
             }
             let params: Params
         }
-        let payload = try encoder.encode(ApprovalMsg(params: .init(active: true, type: options.approvalType, summary: options.approvalSummary)))
+        let payload = try encoder.encode(ApprovalMsg(params: .init(active: true, type: options.approvalType, summary: options.approvalSummary, card: options.card)))
         _ = try BLEQuotaWriter(
             payload: payload,
             verbose: options.verbose,
             expectedIdentifier: options.deviceIdentifier
         ).write()
-        print("✓ 已向 StopWatch 发送人工确认请求：[\(options.approvalType)] \(options.approvalSummary)")
+        print("✓ 已向 StopWatch 发送人工确认请求：[\(options.approvalType)] \(options.approvalSummary) (Card: \(options.card ?? "current"))")
         return
     }
 
@@ -675,14 +684,16 @@ private func run() throws {
     }
 
     repeat {
-        let snapshot: QuotaSnapshot
+        var snapshot: QuotaSnapshot
         if options.demo {
             snapshot = QuotaSnapshot(
                 remainingPercent: 59,
-                resetInSeconds: 3_600
+                resetInSeconds: 3_600,
+                card: options.card
             )
         } else {
             snapshot = try client!.readRateLimits()
+            snapshot.card = options.card
         }
 
         let payload = try encoder.encode(snapshot)
