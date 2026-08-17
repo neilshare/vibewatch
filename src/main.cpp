@@ -1639,6 +1639,17 @@ void drawPhysicalActionLinks() {
     M5.Display.drawWideLine(393, 28, 381, 58, 5.0f, rightActive ? TFT_WHITE : rightColor);
 }
 
+std::size_t utf8SafeSplitIndex(const char* str, std::size_t maxBytes) {
+    if (str == nullptr) return 0;
+    std::size_t len = std::strlen(str);
+    if (len <= maxBytes) return len;
+    std::size_t idx = maxBytes;
+    while (idx > 0 && (static_cast<std::uint8_t>(str[idx]) & 0xC0) == 0x80) {
+        --idx;
+    }
+    return idx == 0 ? maxBytes : idx;
+}
+
 void drawApprovalOverlay() {
     if (!g_approval.active) return;
 
@@ -1686,12 +1697,16 @@ void drawApprovalOverlay() {
     }
     M5.Display.setTextColor(muted, cardBg);
 
-    const int summaryLen = std::strlen(g_approval.summary);
-    if (summaryLen > 20) {
-        char line1[32] = {};
-        char line2[32] = {};
-        std::strncpy(line1, g_approval.summary, 18);
-        std::strncpy(line2, g_approval.summary + 18, 22);
+    const std::size_t summaryLen = std::strlen(g_approval.summary);
+    if (summaryLen > 22) {
+        char line1[48] = {};
+        char line2[48] = {};
+        const std::size_t split1 = utf8SafeSplitIndex(g_approval.summary, 22);
+        std::memcpy(line1, g_approval.summary, split1);
+        line1[split1] = '\0';
+        const std::size_t split2 = utf8SafeSplitIndex(g_approval.summary + split1, 26);
+        std::memcpy(line2, g_approval.summary + split1, split2);
+        line2[split2] = '\0';
         M5.Display.drawString(line1, kScreenCenter, cardY + 118);
         M5.Display.drawString(line2, kScreenCenter, cardY + 148);
     } else {
