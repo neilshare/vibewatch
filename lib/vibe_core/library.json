@@ -1,0 +1,8 @@
+{
+  "name": "vibe_core",
+  "version": "1.1.0",
+  "build": { "flags": "-std=gnu++17" },
+  "dependencies": { "bblanchon/ArduinoJson": "7.4.3" },
+  "frameworks": "*",
+  "platforms": "*"
+}
