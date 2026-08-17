@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "vibe_approval.h"
+
 namespace vibe {
 
 constexpr std::size_t kIngressPayloadLength = 512;
@@ -16,12 +18,15 @@ enum class IngressKind : std::uint8_t { Quota, Approval, Disconnect };
 struct IngressMessage {
     IngressKind kind{IngressKind::Quota};
     std::uint16_t connectionHandle{0};
+    std::uint32_t connectionGeneration{0};
     std::uint16_t length{0};
     std::array<std::uint8_t, kIngressPayloadLength> payload{};
 };
 
 struct HidChunk {
     std::uint16_t connectionHandle{0};
+    std::uint32_t connectionGeneration{0};
+    std::uint32_t streamEpoch{0};
     std::uint8_t length{0};
     std::array<std::uint8_t, kHidChunkPayloadLength> payload{};
 };
@@ -31,6 +36,140 @@ enum class EnqueueResult : std::uint8_t {
     PayloadTooLarge,
     QueueFull,
     Unauthorized
+};
+
+class ApprovalIteration {
+  public:
+    explicit ApprovalIteration(std::uint32_t nowMs) : nowMs_(nowMs) {}
+
+    ApprovalAcceptResult accept(ApprovalController& controller,
+                                const ApprovalRequestV2& request) const {
+        return controller.accept(request, nowMs_);
+    }
+
+    OptionalValue<ApprovalDecisionV2> expire(
+        ApprovalController& controller) const {
+        return controller.expireIfNeeded(nowMs_);
+    }
+
+    std::uint32_t nowMs() const { return nowMs_; }
+
+  private:
+    std::uint32_t nowMs_;
+};
+
+bool hidRpcMethodAllowed(const char* method);
+
+struct HidStreamToken {
+    std::uint16_t connectionHandle{0};
+    std::uint32_t connectionGeneration{0};
+    std::uint32_t streamEpoch{0};
+    bool active{false};
+};
+
+template <std::size_t Capacity>
+class HidStreamTracker {
+  public:
+    HidStreamToken connect(std::uint16_t connectionHandle) {
+        Slot* slot = find(connectionHandle);
+        if (slot == nullptr) {
+            slot = findInactive();
+        }
+        if (slot == nullptr) {
+            return {};
+        }
+        slot->connectionHandle = connectionHandle;
+        slot->connectionGeneration = nextGeneration_++;
+        if (nextGeneration_ == 0) {
+            nextGeneration_ = 1;
+        }
+        slot->streamEpoch = 1;
+        slot->active = true;
+        return token(*slot);
+    }
+
+    void disconnect(std::uint16_t connectionHandle) {
+        Slot* slot = find(connectionHandle);
+        if (slot != nullptr) {
+            slot->active = false;
+            ++slot->streamEpoch;
+        }
+    }
+
+    void noteEnqueueResult(std::uint16_t connectionHandle,
+                           EnqueueResult result) {
+        if (result != EnqueueResult::QueueFull) {
+            return;
+        }
+        Slot* slot = find(connectionHandle);
+        if (slot != nullptr) {
+            ++slot->streamEpoch;
+            if (slot->streamEpoch == 0) {
+                slot->streamEpoch = 1;
+            }
+        }
+    }
+
+    HidStreamToken current(std::uint16_t connectionHandle) const {
+        const Slot* slot = find(connectionHandle);
+        return slot == nullptr ? HidStreamToken{} : token(*slot);
+    }
+
+    bool isCurrent(const HidChunk& chunk) const {
+        const HidStreamToken value = current(chunk.connectionHandle);
+        return value.active &&
+               value.connectionGeneration == chunk.connectionGeneration &&
+               value.streamEpoch == chunk.streamEpoch;
+    }
+
+  private:
+    struct Slot {
+        bool active{false};
+        std::uint16_t connectionHandle{0};
+        std::uint32_t connectionGeneration{0};
+        std::uint32_t streamEpoch{0};
+    };
+
+    Slot* find(std::uint16_t connectionHandle) {
+        for (auto& slot : slots_) {
+            if (slot.connectionGeneration != 0 &&
+                slot.connectionHandle == connectionHandle) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    const Slot* find(std::uint16_t connectionHandle) const {
+        for (const auto& slot : slots_) {
+            if (slot.connectionGeneration != 0 &&
+                slot.connectionHandle == connectionHandle) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    Slot* findInactive() {
+        for (auto& slot : slots_) {
+            if (!slot.active) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    static HidStreamToken token(const Slot& slot) {
+        HidStreamToken value;
+        value.connectionHandle = slot.connectionHandle;
+        value.connectionGeneration = slot.connectionGeneration;
+        value.streamEpoch = slot.streamEpoch;
+        value.active = slot.active;
+        return value;
+    }
+
+    std::array<Slot, Capacity> slots_{};
+    std::uint32_t nextGeneration_{1};
 };
 
 template <std::size_t Capacity, std::size_t MaxPayloadLength>
@@ -108,11 +247,13 @@ class HidRpcAssembler {
         bool active{false};
         bool completed{false};
         std::uint16_t connectionHandle{0};
+        std::uint32_t connectionGeneration{0};
+        std::uint32_t streamEpoch{0};
         std::size_t length{0};
         std::array<std::uint8_t, kHidRpcAssemblyLength> payload{};
     };
 
-    Assembly* findOrCreate(std::uint16_t connectionHandle);
+    Assembly* findOrCreate(const HidChunk& chunk);
     std::array<Assembly, kConnectionSlots> assemblies_{};
 };
 

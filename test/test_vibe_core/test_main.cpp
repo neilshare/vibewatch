@@ -273,6 +273,13 @@ static HidChunk hidChunk(std::uint16_t handle, const char* payload) {
     return chunk;
 }
 
+static HidChunk hidChunk(HidStreamToken token, const char* payload) {
+    HidChunk chunk = hidChunk(token.connectionHandle, payload);
+    chunk.connectionGeneration = token.connectionGeneration;
+    chunk.streamEpoch = token.streamEpoch;
+    return chunk;
+}
+
 void test_hid_rpc_assembly_is_connection_scoped_and_main_loop_parsed() {
     HidRpcAssembler assembler;
     HidRpcView completed{};
@@ -316,6 +323,74 @@ void test_encodes_bounded_v2_protocol_error() {
     TEST_ASSERT_EQUAL_UINT(std::strlen(output), written);
 }
 
+void test_new_approval_cannot_expire_in_accepting_iteration_at_wrap() {
+    ApprovalController controller;
+    ApprovalIteration iteration(std::numeric_limits<std::uint32_t>::max() - 7);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(ApprovalAcceptResult::Accepted),
+        static_cast<std::uint8_t>(iteration.accept(
+            controller,
+            request("550e8400-e29b-41d4-a716-446655440000", 5000))));
+    TEST_ASSERT_FALSE(iteration.expire(controller).hasValue);
+    TEST_ASSERT_TRUE(controller.pending());
+}
+
+void test_hid_rpc_rejects_all_legacy_approval_method_aliases() {
+    TEST_ASSERT_FALSE(hidRpcMethodAllowed("v.oai.approval_req"));
+    TEST_ASSERT_FALSE(hidRpcMethodAllowed("approval"));
+    TEST_ASSERT_FALSE(hidRpcMethodAllowed("v.oai.prompt"));
+    TEST_ASSERT_TRUE(hidRpcMethodAllowed("v.oai.thstatus"));
+    TEST_ASSERT_TRUE(hidRpcMethodAllowed("quota"));
+}
+
+void test_hid_overflow_resets_stream_and_rejects_queued_old_epoch() {
+    HidStreamTracker<3> streams;
+    HidRpcAssembler assembler;
+    HidRpcView completed{};
+
+    const auto beforeOverflow = streams.connect(1);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Incomplete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(beforeOverflow, R"json({"method":"old")json"), completed)));
+
+    streams.noteEnqueueResult(1, EnqueueResult::QueueFull);
+    const auto afterOverflow = streams.current(1);
+    TEST_ASSERT_FALSE(streams.isCurrent(hidChunk(beforeOverflow, R"json(})json")));
+    TEST_ASSERT_TRUE(afterOverflow.streamEpoch != beforeOverflow.streamEpoch);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Complete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(afterOverflow, R"json({"method":"new"})json"), completed)));
+    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"new"})json", completed.data,
+                             completed.length);
+}
+
+void test_hid_reconnect_generation_rejects_prior_handle_chunks() {
+    HidStreamTracker<3> streams;
+    HidRpcAssembler assembler;
+    HidRpcView completed{};
+
+    const auto firstConnection = streams.connect(2);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Incomplete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(firstConnection, R"json({"method":"stale")json"), completed)));
+    streams.disconnect(2);
+    const auto secondConnection = streams.connect(2);
+
+    TEST_ASSERT_FALSE(streams.isCurrent(
+        hidChunk(firstConnection, R"json(})json")));
+    TEST_ASSERT_TRUE(secondConnection.connectionGeneration !=
+                     firstConnection.connectionGeneration);
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(HidConsumeResult::Complete),
+        static_cast<std::uint8_t>(assembler.consume(
+            hidChunk(secondConnection, R"json({"method":"fresh"})json"), completed)));
+    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"fresh"})json", completed.data,
+                             completed.length);
+}
+
 void setup() {
     UNITY_BEGIN();
     RUN_TEST(test_accept_duplicate_busy_and_decide);
@@ -335,6 +410,10 @@ void setup() {
     RUN_TEST(test_ingress_buffer_rejects_missing_payload_bytes);
     RUN_TEST(test_hid_rpc_assembly_is_connection_scoped_and_main_loop_parsed);
     RUN_TEST(test_encodes_bounded_v2_protocol_error);
+    RUN_TEST(test_new_approval_cannot_expire_in_accepting_iteration_at_wrap);
+    RUN_TEST(test_hid_rpc_rejects_all_legacy_approval_method_aliases);
+    RUN_TEST(test_hid_overflow_resets_stream_and_rejects_queued_old_epoch);
+    RUN_TEST(test_hid_reconnect_generation_rejects_prior_handle_chunks);
     UNITY_END();
 }
 

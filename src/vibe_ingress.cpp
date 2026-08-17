@@ -30,6 +30,7 @@ bool initializeIngressQueue() {
 
 EnqueueResult enqueueGattWrite(IngressKind kind,
                                std::uint16_t connectionHandle,
+                               std::uint32_t connectionGeneration,
                                const std::uint8_t* data,
                                std::size_t length,
                                bool authorized) {
@@ -47,6 +48,7 @@ EnqueueResult enqueueGattWrite(IngressKind kind,
     IngressMessage message{};
     message.kind = kind;
     message.connectionHandle = connectionHandle;
+    message.connectionGeneration = connectionGeneration;
     message.length = static_cast<std::uint16_t>(length);
     if (length > 0) {
         std::memcpy(message.payload.data(), data, length);
@@ -57,6 +59,8 @@ EnqueueResult enqueueGattWrite(IngressKind kind,
 }
 
 EnqueueResult enqueueHidChunk(std::uint16_t connectionHandle,
+                              std::uint32_t connectionGeneration,
+                              std::uint32_t streamEpoch,
                               const std::uint8_t* data,
                               std::size_t length) {
     if (length == 0 || length > kHidChunkPayloadLength || data == nullptr) {
@@ -68,6 +72,8 @@ EnqueueResult enqueueHidChunk(std::uint16_t connectionHandle,
 
     HidChunk chunk{};
     chunk.connectionHandle = connectionHandle;
+    chunk.connectionGeneration = connectionGeneration;
+    chunk.streamEpoch = streamEpoch;
     chunk.length = static_cast<std::uint8_t>(length);
     std::memcpy(chunk.payload.data(), data, length);
     return xQueueSend(g_hidChunkQueue, &chunk, 0) == pdTRUE

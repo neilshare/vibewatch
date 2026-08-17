@@ -4,10 +4,28 @@
 
 namespace vibe {
 
+bool hidRpcMethodAllowed(const char* method) {
+    if (method == nullptr) {
+        return false;
+    }
+    return std::strcmp(method, "v.oai.approval_req") != 0 &&
+           std::strcmp(method, "approval") != 0 &&
+           std::strcmp(method, "v.oai.prompt") != 0;
+}
+
 HidRpcAssembler::Assembly* HidRpcAssembler::findOrCreate(
-    std::uint16_t connectionHandle) {
+    const HidChunk& chunk) {
     for (auto& assembly : assemblies_) {
-        if (assembly.active && assembly.connectionHandle == connectionHandle) {
+        if (assembly.active &&
+            assembly.connectionHandle == chunk.connectionHandle) {
+            if (assembly.connectionGeneration != chunk.connectionGeneration ||
+                assembly.streamEpoch != chunk.streamEpoch) {
+                assembly = {};
+                assembly.active = true;
+                assembly.connectionHandle = chunk.connectionHandle;
+                assembly.connectionGeneration = chunk.connectionGeneration;
+                assembly.streamEpoch = chunk.streamEpoch;
+            }
             return &assembly;
         }
     }
@@ -15,7 +33,9 @@ HidRpcAssembler::Assembly* HidRpcAssembler::findOrCreate(
         if (!assembly.active) {
             assembly = {};
             assembly.active = true;
-            assembly.connectionHandle = connectionHandle;
+            assembly.connectionHandle = chunk.connectionHandle;
+            assembly.connectionGeneration = chunk.connectionGeneration;
+            assembly.streamEpoch = chunk.streamEpoch;
             return &assembly;
         }
     }
@@ -29,7 +49,7 @@ HidConsumeResult HidRpcAssembler::consume(const HidChunk& chunk,
         return HidConsumeResult::InvalidPayload;
     }
 
-    Assembly* assembly = findOrCreate(chunk.connectionHandle);
+    Assembly* assembly = findOrCreate(chunk);
     if (assembly == nullptr) {
         return HidConsumeResult::ConnectionLimit;
     }

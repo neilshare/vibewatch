@@ -109,40 +109,35 @@ NimBLECharacteristic* g_vendorInput = nullptr;
 NimBLECharacteristic* g_vendorOutput = nullptr;
 NimBLECharacteristic* g_approvalResult = nullptr;
 
-volatile bool g_connected = false;
-volatile bool g_uiDirty = true;
-volatile bool g_pairingSuccessPending = false;
+bool g_connected = false;
+bool g_uiDirty = true;
+portMUX_TYPE g_callbackStateMux = portMUX_INITIALIZER_UNLOCKED;
+bool g_pairingSuccessPending = false;
 
 struct CallbackConnection {
-    volatile bool active{false};
-    volatile std::uint16_t connectionHandle{0};
-    volatile bool configurePending{false};
+    bool active{false};
+    std::uint16_t connectionHandle{0};
+    std::uint32_t connectionGeneration{0};
+    bool configurePending{false};
+    bool disconnectFallbackPending{false};
+    std::uint32_t disconnectedGeneration{0};
+    bool hidResetPending{false};
+    bool approvalOverflowPending{false};
+    std::uint32_t approvalOverflowGeneration{0};
+    bool approvalIndicationsEnabled{false};
 };
 
-std::array<CallbackConnection, 3> g_callbackConnections{};
+std::array<CallbackConnection, 6> g_callbackConnections{};
+vibe::HidStreamTracker<3> g_hidStreamTracker;
 
-struct ApprovalSubscription {
-    volatile bool active{false};
-    volatile std::uint16_t connectionHandle{0};
+struct IndicationStatusHandoff {
+    bool pending{false};
+    int code{0};
+    std::uint32_t deliveryId{0};
 };
 
-std::array<ApprovalSubscription, 3> g_approvalSubscriptions{};
-
-struct DisconnectFallback {
-    volatile bool active{false};
-    volatile std::uint16_t connectionHandle{0};
-};
-
-std::array<DisconnectFallback, 3> g_disconnectFallbacks{};
-
-struct ApprovalOverflowNotice {
-    volatile bool active{false};
-    volatile std::uint16_t connectionHandle{0};
-};
-
-std::array<ApprovalOverflowNotice, 3> g_approvalOverflowNotices{};
-volatile bool g_indicationStatusPending = false;
-volatile int g_indicationStatusCode = 0;
+IndicationStatusHandoff g_indicationStatusHandoff;
+std::uint32_t g_callbackDeliveryId{0};
 
 vibe::HidRpcAssembler g_hidRpcAssembler;
 
@@ -225,17 +220,24 @@ void playSe(float frequency = 880.0f, std::uint32_t durationMs = 35);
 ApprovalState g_approval;
 vibe::ApprovalController g_approvalController;
 std::uint16_t g_pendingApprovalConnection = 0;
+std::uint32_t g_pendingApprovalGeneration = 0;
 bool g_v2ApprovalActive = false;
 
 struct PendingIndication {
     bool active{false};
     std::uint16_t connectionHandle{0};
+    std::uint32_t connectionGeneration{0};
+    std::uint32_t deliveryId{0};
     std::uint16_t length{0};
     std::array<std::uint8_t, vibe::kIngressPayloadLength> payload{};
     std::uint32_t deadlineMs{0};
 };
 
 PendingIndication g_pendingIndication;
+std::uint32_t g_nextIndicationDeliveryId = 1;
+bool g_indicationTransportBlocked = false;
+std::uint16_t g_blockedIndicationConnection = 0;
+std::uint32_t g_blockedIndicationGeneration = 0;
 constexpr std::uint32_t kIndicationDeliveryTimeoutMs = 5000;
 
 constexpr std::uint32_t kApprovalSwitchCooldownMs = 4000;
@@ -715,6 +717,10 @@ void processRpc(const std::uint8_t* json, std::size_t length,
     }
 
     const char* method = request["method"] | request["m"] | "";
+    if (!vibe::hidRpcMethodAllowed(method)) {
+        Serial.println("HID approval ingress rejected");
+        return;
+    }
     int id = request["id"] | request["i"] | -1;
     JsonVariantConst params = request["params"];
     if (params.isNull()) {
@@ -729,8 +735,6 @@ void processRpc(const std::uint8_t* json, std::size_t length,
         applyFocusedApp(params);
     } else if (std::strcmp(method, "v.oai.quota") == 0 || std::strcmp(method, "quota") == 0) {
         applyQuotaStatus(params);
-    } else if (std::strcmp(method, "v.oai.approval_req") == 0 || std::strcmp(method, "approval") == 0 || std::strcmp(method, "v.oai.prompt") == 0) {
-        applyApprovalRequest(params);
     }
 
     if (id >= 0 && method[0] != '\0') {
@@ -738,94 +742,211 @@ void processRpc(const std::uint8_t* json, std::size_t length,
     }
 }
 
-bool approvalIndicationsEnabled(std::uint16_t connectionHandle) {
-    for (const auto& subscription : g_approvalSubscriptions) {
-        if (subscription.active &&
-            subscription.connectionHandle == connectionHandle) {
-            return true;
+CallbackConnection* findCallbackConnectionLocked(
+    std::uint16_t connectionHandle) {
+    for (auto& connection : g_callbackConnections) {
+        if (connection.connectionGeneration != 0 &&
+            connection.connectionHandle == connectionHandle) {
+            return &connection;
         }
     }
-    return false;
+    return nullptr;
 }
 
-void updateCallbackConnection(std::uint16_t connectionHandle, bool connected) {
+CallbackConnection* findInactiveCallbackConnectionLocked() {
     for (auto& connection : g_callbackConnections) {
-        if (connection.active &&
-            connection.connectionHandle == connectionHandle) {
-            connection.active = connected;
-            connection.configurePending = connected;
-            return;
+        if (!connection.active &&
+            !connection.disconnectFallbackPending) {
+            return &connection;
         }
     }
-    if (!connected) {
-        return;
+    return nullptr;
+}
+
+vibe::HidStreamToken publishConnectionConnected(
+    std::uint16_t connectionHandle) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    const vibe::HidStreamToken token =
+        g_hidStreamTracker.connect(connectionHandle);
+    CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection == nullptr) {
+        connection = findInactiveCallbackConnectionLocked();
     }
-    for (auto& connection : g_callbackConnections) {
-        if (!connection.active) {
-            connection.connectionHandle = connectionHandle;
-            connection.configurePending = true;
-            connection.active = true;
-            return;
+    if (connection != nullptr && token.active) {
+        const bool disconnectFallbackPending =
+            connection->disconnectFallbackPending;
+        const std::uint32_t disconnectedGeneration =
+            connection->disconnectedGeneration;
+        *connection = {};
+        connection->active = true;
+        connection->connectionHandle = connectionHandle;
+        connection->connectionGeneration = token.connectionGeneration;
+        connection->configurePending = true;
+        connection->disconnectFallbackPending =
+            disconnectFallbackPending;
+        connection->disconnectedGeneration = disconnectedGeneration;
+    }
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return token;
+}
+
+vibe::HidStreamToken currentConnectionToken(
+    std::uint16_t connectionHandle) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    const vibe::HidStreamToken token =
+        g_hidStreamTracker.current(connectionHandle);
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return token;
+}
+
+void publishConnectionDisconnected(std::uint16_t connectionHandle,
+                                   std::uint32_t generation,
+                                   bool queueFallback) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr &&
+        connection->connectionGeneration == generation) {
+        connection->active = false;
+        connection->approvalIndicationsEnabled = false;
+        if (queueFallback) {
+            connection->disconnectFallbackPending = true;
+            connection->disconnectedGeneration = generation;
         }
     }
+    g_hidStreamTracker.disconnect(connectionHandle);
+    portEXIT_CRITICAL(&g_callbackStateMux);
+}
+
+bool approvalIndicationsEnabled(std::uint16_t connectionHandle,
+                                std::uint32_t generation) {
+    bool enabled = false;
+    portENTER_CRITICAL(&g_callbackStateMux);
+    const CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr) {
+        enabled = connection->active &&
+                  connection->connectionGeneration == generation &&
+                  connection->approvalIndicationsEnabled;
+    }
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return enabled;
+}
+
+void publishApprovalSubscription(std::uint16_t connectionHandle,
+                                 bool enabled) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr && connection->active) {
+        connection->approvalIndicationsEnabled = enabled;
+    }
+    portEXIT_CRITICAL(&g_callbackStateMux);
 }
 
 bool anyCallbackConnectionActive() {
+    bool active = false;
+    portENTER_CRITICAL(&g_callbackStateMux);
     for (const auto& connection : g_callbackConnections) {
-        if (connection.active) {
-            return true;
-        }
+        active = active || connection.active;
     }
-    return false;
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return active;
 }
 
-bool callbackConnectionActive(std::uint16_t connectionHandle) {
-    for (const auto& connection : g_callbackConnections) {
-        if (connection.active &&
-            connection.connectionHandle == connectionHandle) {
-            return true;
-        }
+bool callbackConnectionCurrent(std::uint16_t connectionHandle,
+                               std::uint32_t generation) {
+    bool current = false;
+    portENTER_CRITICAL(&g_callbackStateMux);
+    const CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr) {
+        current = connection->active &&
+                  connection->connectionGeneration == generation;
     }
-    return false;
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return current;
 }
 
-void updateApprovalSubscription(std::uint16_t connectionHandle,
-                                bool enabled) {
-    for (auto& subscription : g_approvalSubscriptions) {
-        if (subscription.active &&
-            subscription.connectionHandle == connectionHandle) {
-            subscription.active = enabled;
-            return;
-        }
+void refreshIndicationTransportBlock() {
+    if (g_indicationTransportBlocked &&
+        !callbackConnectionCurrent(g_blockedIndicationConnection,
+                                   g_blockedIndicationGeneration)) {
+        g_indicationTransportBlocked = false;
+        g_blockedIndicationConnection = 0;
+        g_blockedIndicationGeneration = 0;
     }
-    if (!enabled) {
+}
+
+bool hidChunkCurrent(const vibe::HidChunk& chunk) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    const bool current = g_hidStreamTracker.isCurrent(chunk);
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return current;
+}
+
+void publishHidEnqueueResult(std::uint16_t connectionHandle,
+                             vibe::EnqueueResult result) {
+    if (result != vibe::EnqueueResult::QueueFull) {
         return;
     }
-    for (auto& subscription : g_approvalSubscriptions) {
-        if (!subscription.active) {
-            subscription.connectionHandle = connectionHandle;
-            subscription.active = true;
-            return;
-        }
+    portENTER_CRITICAL(&g_callbackStateMux);
+    g_hidStreamTracker.noteEnqueueResult(connectionHandle, result);
+    CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr) {
+        connection->hidResetPending = true;
     }
+    portEXIT_CRITICAL(&g_callbackStateMux);
+}
+
+void publishApprovalOverflow(std::uint16_t connectionHandle,
+                             std::uint32_t generation) {
+    portENTER_CRITICAL(&g_callbackStateMux);
+    CallbackConnection* connection =
+        findCallbackConnectionLocked(connectionHandle);
+    if (connection != nullptr &&
+        connection->connectionGeneration == generation) {
+        connection->approvalOverflowPending = true;
+        connection->approvalOverflowGeneration = generation;
+    }
+    portEXIT_CRITICAL(&g_callbackStateMux);
 }
 
 bool sendIndicationPayload(const std::uint8_t* payload, std::size_t length,
                            std::uint16_t connectionHandle,
+                           std::uint32_t connectionGeneration,
                            std::uint32_t nowMs) {
+    refreshIndicationTransportBlock();
     if (g_approvalResult == nullptr || payload == nullptr || length == 0 ||
         length > g_pendingIndication.payload.size() ||
-        g_pendingIndication.active) {
+        g_pendingIndication.active || g_indicationTransportBlocked ||
+        !callbackConnectionCurrent(connectionHandle,
+                                   connectionGeneration)) {
         return false;
     }
 
     std::memcpy(g_pendingIndication.payload.data(), payload, length);
     g_pendingIndication.connectionHandle = connectionHandle;
+    g_pendingIndication.connectionGeneration = connectionGeneration;
     g_pendingIndication.length = static_cast<std::uint16_t>(length);
     g_pendingIndication.deadlineMs = nowMs + kIndicationDeliveryTimeoutMs;
+    g_pendingIndication.deliveryId = g_nextIndicationDeliveryId++;
+    if (g_nextIndicationDeliveryId == 0) {
+        g_nextIndicationDeliveryId = 1;
+    }
     g_pendingIndication.active = true;
+    portENTER_CRITICAL(&g_callbackStateMux);
+    g_callbackDeliveryId = g_pendingIndication.deliveryId;
+    portEXIT_CRITICAL(&g_callbackStateMux);
     if (!g_approvalResult->indicate(g_pendingIndication.payload.data(), length,
                                     connectionHandle)) {
+        portENTER_CRITICAL(&g_callbackStateMux);
+        if (g_callbackDeliveryId == g_pendingIndication.deliveryId) {
+            g_callbackDeliveryId = 0;
+        }
+        portEXIT_CRITICAL(&g_callbackStateMux);
         g_pendingIndication = {};
         return false;
     }
@@ -834,6 +955,7 @@ bool sendIndicationPayload(const std::uint8_t* payload, std::size_t length,
 
 bool queueApprovalDecision(const vibe::ApprovalDecisionV2& decision,
                            std::uint16_t connectionHandle,
+                           std::uint32_t connectionGeneration,
                            std::uint32_t nowMs) {
     char json[vibe::kIngressPayloadLength]{};
     std::size_t written = 0;
@@ -842,11 +964,12 @@ bool queueApprovalDecision(const vibe::ApprovalDecisionV2& decision,
     }
     return sendIndicationPayload(
         reinterpret_cast<const std::uint8_t*>(json), written,
-        connectionHandle, nowMs);
+        connectionHandle, connectionGeneration, nowMs);
 }
 
 bool queueProtocolError(const char* requestId, vibe::ProtocolErrorCode code,
                         const char* message, std::uint16_t connectionHandle,
+                        std::uint32_t connectionGeneration,
                         std::uint32_t nowMs) {
     char json[vibe::kIngressPayloadLength]{};
     std::size_t written = 0;
@@ -856,7 +979,7 @@ bool queueProtocolError(const char* requestId, vibe::ProtocolErrorCode code,
     }
     return sendIndicationPayload(
         reinterpret_cast<const std::uint8_t*>(json), written,
-        connectionHandle, nowMs);
+        connectionHandle, connectionGeneration, nowMs);
 }
 
 void presentApprovalRequest(const vibe::ApprovalRequestV2& request,
@@ -883,12 +1006,13 @@ void presentApprovalRequest(const vibe::ApprovalRequestV2& request,
 }
 
 void decidePendingApproval(vibe::ApprovalChoice choice) {
-    if (g_pendingIndication.active) {
+    if (g_pendingIndication.active || g_indicationTransportBlocked) {
         Serial.println("approval decision deferred: indication busy");
         return;
     }
     const std::uint32_t nowMs = millis();
-    if (!callbackConnectionActive(g_pendingApprovalConnection)) {
+    if (!callbackConnectionCurrent(g_pendingApprovalConnection,
+                                   g_pendingApprovalGeneration)) {
         const auto cancelled = g_approvalController.cancel(nowMs);
         if (cancelled.hasValue) {
             Serial.printf("approval cancelled before input request_id=%.8s\n",
@@ -897,16 +1021,18 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
         g_v2ApprovalActive = false;
         g_approval.active = false;
         g_pendingApprovalConnection = 0;
+        g_pendingApprovalGeneration = 0;
         g_uiDirty = true;
         return;
     }
     const auto expired = g_approvalController.expireIfNeeded(nowMs);
     if (expired.hasValue) {
         queueApprovalDecision(expired.value, g_pendingApprovalConnection,
-                              nowMs);
+                              g_pendingApprovalGeneration, nowMs);
         g_v2ApprovalActive = false;
         g_approval.active = false;
         g_pendingApprovalConnection = 0;
+        g_pendingApprovalGeneration = 0;
         g_uiDirty = true;
         return;
     }
@@ -916,13 +1042,14 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
     }
 
     if (!queueApprovalDecision(decision.value, g_pendingApprovalConnection,
-                               nowMs)) {
+                               g_pendingApprovalGeneration, nowMs)) {
         Serial.printf("approval decision transport_error request_id=%.8s\n",
                       decision.value.requestId);
     }
     g_v2ApprovalActive = false;
     g_approval.active = false;
     g_pendingApprovalConnection = 0;
+    g_pendingApprovalGeneration = 0;
     if (choice == vibe::ApprovalChoice::Approve) {
         playSe(1350.0f, 60);
         vibrate(180, 50);
@@ -934,21 +1061,24 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
 }
 
 void expirePendingApproval(std::uint32_t nowMs) {
-    if (g_pendingIndication.active) {
+    refreshIndicationTransportBlock();
+    if (g_pendingIndication.active || g_indicationTransportBlocked) {
         return;
     }
-    const auto expired = g_approvalController.expireIfNeeded(nowMs);
+    const vibe::ApprovalIteration iteration(nowMs);
+    const auto expired = iteration.expire(g_approvalController);
     if (!expired.hasValue) {
         return;
     }
     if (!queueApprovalDecision(expired.value, g_pendingApprovalConnection,
-                               nowMs)) {
+                               g_pendingApprovalGeneration, nowMs)) {
         Serial.printf("approval expired transport_error request_id=%.8s\n",
                       expired.value.requestId);
     }
     g_v2ApprovalActive = false;
     g_approval.active = false;
     g_pendingApprovalConnection = 0;
+    g_pendingApprovalGeneration = 0;
     g_uiDirty = true;
 }
 
@@ -961,7 +1091,8 @@ void processApprovalIngress(const vibe::IngressMessage& ingress,
                               ? vibe::ProtocolErrorCode::UnsupportedVersion
                               : vibe::ProtocolErrorCode::InvalidPayload;
         if (!queueProtocolError("", code, "approval request rejected",
-                                ingress.connectionHandle, nowMs)) {
+                                ingress.connectionHandle,
+                                ingress.connectionGeneration, nowMs)) {
             Serial.println("approval error delivery transport_error");
         }
         return;
@@ -975,29 +1106,35 @@ void processApprovalIngress(const vibe::IngressMessage& ingress,
         return;
     }
 
-    if (!approvalIndicationsEnabled(ingress.connectionHandle)) {
+    if (!approvalIndicationsEnabled(ingress.connectionHandle,
+                                    ingress.connectionGeneration)) {
         if (!queueProtocolError(decoded.request.requestId,
                                 vibe::ProtocolErrorCode::TransportError,
                                 "approval indications are not enabled",
-                                ingress.connectionHandle, nowMs)) {
+                                ingress.connectionHandle,
+                                ingress.connectionGeneration, nowMs)) {
             Serial.printf("approval transport_error request_id=%.8s\n",
                           decoded.request.requestId);
         }
         return;
     }
 
-    if (g_pendingIndication.active) {
+    refreshIndicationTransportBlock();
+    if (g_pendingIndication.active || g_indicationTransportBlocked) {
         Serial.printf("approval transport busy request_id=%.8s\n",
                       decoded.request.requestId);
         return;
     }
 
-    const auto accepted = g_approvalController.accept(decoded.request, nowMs);
+    const vibe::ApprovalIteration iteration(nowMs);
+    const auto accepted = iteration.accept(g_approvalController,
+                                           decoded.request);
     if (accepted == vibe::ApprovalAcceptResult::Busy) {
         queueProtocolError(decoded.request.requestId,
                            vibe::ProtocolErrorCode::Busy,
                            "another request is pending",
-                           ingress.connectionHandle, nowMs);
+                           ingress.connectionHandle,
+                           ingress.connectionGeneration, nowMs);
         return;
     }
     if (accepted == vibe::ApprovalAcceptResult::Duplicate) {
@@ -1007,6 +1144,7 @@ void processApprovalIngress(const vibe::IngressMessage& ingress,
     }
 
     g_pendingApprovalConnection = ingress.connectionHandle;
+    g_pendingApprovalGeneration = ingress.connectionGeneration;
     presentApprovalRequest(decoded.request, nowMs);
 }
 
@@ -1018,15 +1156,18 @@ void processIngressMessage(const vibe::IngressMessage& ingress,
         g_activeTouch = -1;
         g_uiDirty = true;
         if (g_approvalController.pending() &&
-            g_pendingApprovalConnection == ingress.connectionHandle) {
+            g_pendingApprovalConnection == ingress.connectionHandle &&
+            g_pendingApprovalGeneration == ingress.connectionGeneration) {
             const auto cancelled = g_approvalController.cancel(nowMs);
             g_v2ApprovalActive = false;
             g_approval.active = false;
             g_pendingApprovalConnection = 0;
+            g_pendingApprovalGeneration = 0;
             g_uiDirty = true;
             if (cancelled.hasValue &&
                 !queueApprovalDecision(cancelled.value,
-                                       ingress.connectionHandle, nowMs)) {
+                                       ingress.connectionHandle,
+                                       ingress.connectionGeneration, nowMs)) {
                 Serial.printf("approval cancelled transport_error request_id=%.8s\n",
                               cancelled.value.requestId);
             }
@@ -1037,7 +1178,8 @@ void processIngressMessage(const vibe::IngressMessage& ingress,
         return;
     }
 
-    if (!callbackConnectionActive(ingress.connectionHandle)) {
+    if (!callbackConnectionCurrent(ingress.connectionHandle,
+                                   ingress.connectionGeneration)) {
         return;
     }
 
@@ -1060,11 +1202,15 @@ void processIngressMessage(const vibe::IngressMessage& ingress,
 }
 
 void processHidChunkInMainLoop(const vibe::HidChunk& chunk) {
-    if (!callbackConnectionActive(chunk.connectionHandle)) {
+    if (!hidChunkCurrent(chunk)) {
         return;
     }
     vibe::HidRpcView completed{};
     const auto result = g_hidRpcAssembler.consume(chunk, completed);
+    if (!hidChunkCurrent(chunk)) {
+        g_hidRpcAssembler.clear(chunk.connectionHandle);
+        return;
+    }
     if (result == vibe::HidConsumeResult::Complete) {
         processRpc(completed.data, completed.length,
                    completed.connectionHandle);
@@ -1074,14 +1220,29 @@ void processHidChunkInMainLoop(const vibe::HidChunk& chunk) {
     }
 }
 
+bool takeIndicationStatus(IndicationStatusHandoff& status) {
+    bool available = false;
+    portENTER_CRITICAL(&g_callbackStateMux);
+    if (g_indicationStatusHandoff.pending) {
+        status = g_indicationStatusHandoff;
+        g_indicationStatusHandoff.pending = false;
+        if (g_callbackDeliveryId == status.deliveryId) {
+            g_callbackDeliveryId = 0;
+        }
+        available = true;
+    }
+    portEXIT_CRITICAL(&g_callbackStateMux);
+    return available;
+}
+
 void processIndicationTransport(std::uint32_t nowMs) {
-    if (g_indicationStatusPending) {
-        const int statusCode = g_indicationStatusCode;
-        g_indicationStatusPending = false;
-        if (g_pendingIndication.active) {
-            if (statusCode != BLE_HS_EDONE) {
+    IndicationStatusHandoff status{};
+    if (takeIndicationStatus(status)) {
+        if (g_pendingIndication.active &&
+            status.deliveryId == g_pendingIndication.deliveryId) {
+            if (status.code != BLE_HS_EDONE) {
                 Serial.printf("approval indication transport_error status=%d\n",
-                              statusCode);
+                              status.code);
             }
             g_pendingIndication = {};
         }
@@ -1089,75 +1250,80 @@ void processIndicationTransport(std::uint32_t nowMs) {
     if (g_pendingIndication.active &&
         static_cast<std::int32_t>(nowMs - g_pendingIndication.deadlineMs) >= 0) {
         Serial.println("approval indication transport_error timeout");
+        portENTER_CRITICAL(&g_callbackStateMux);
+        if (g_callbackDeliveryId == g_pendingIndication.deliveryId) {
+            g_callbackDeliveryId = 0;
+        }
+        portEXIT_CRITICAL(&g_callbackStateMux);
+        g_indicationTransportBlocked = true;
+        g_blockedIndicationConnection =
+            g_pendingIndication.connectionHandle;
+        g_blockedIndicationGeneration =
+            g_pendingIndication.connectionGeneration;
         g_pendingIndication = {};
     }
 }
 
 void processBleLifecycleEvents(std::uint32_t nowMs) {
-    bool connectionChanged = false;
+    std::array<CallbackConnection, 6> snapshot{};
+    bool pairingSuccess = false;
+    portENTER_CRITICAL(&g_callbackStateMux);
+    snapshot = g_callbackConnections;
     for (auto& connection : g_callbackConnections) {
+        connection.configurePending = false;
+        connection.disconnectFallbackPending = false;
+        connection.hidResetPending = false;
+        connection.approvalOverflowPending = false;
+    }
+    pairingSuccess = g_pairingSuccessPending;
+    g_pairingSuccessPending = false;
+    portEXIT_CRITICAL(&g_callbackStateMux);
+
+    bool connectionChanged = false;
+    bool anyConnected = false;
+    for (const auto& connection : snapshot) {
+        anyConnected = anyConnected || connection.active;
         if (connection.active && connection.configurePending) {
             const std::uint16_t connectionHandle =
                 connection.connectionHandle;
-            connection.configurePending = false;
             if (g_server != nullptr) {
                 g_server->updateConnParams(connectionHandle, 12, 24, 0, 180);
             }
             connectionChanged = true;
             Serial.printf("BLE connected: handle=%u\n", connectionHandle);
         }
+        if (connection.disconnectFallbackPending) {
+            vibe::IngressMessage disconnect{};
+            disconnect.kind = vibe::IngressKind::Disconnect;
+            disconnect.connectionHandle = connection.connectionHandle;
+            disconnect.connectionGeneration =
+                connection.disconnectedGeneration;
+            processIngressMessage(disconnect, nowMs);
+            Serial.printf("disconnect queue_full fallback handle=%u\n",
+                          connection.connectionHandle);
+        }
+        if (connection.hidResetPending) {
+            g_hidRpcAssembler.clear(connection.connectionHandle);
+        }
+        if (connection.approvalOverflowPending &&
+            !queueProtocolError("", vibe::ProtocolErrorCode::QueueFull,
+                                "approval ingress queue is full",
+                                connection.connectionHandle,
+                                connection.approvalOverflowGeneration,
+                                nowMs)) {
+            Serial.printf("approval queue_full handle=%u\n",
+                          connection.connectionHandle);
+        }
     }
-    g_connected = anyCallbackConnectionActive();
+    g_connected = anyConnected;
+    refreshIndicationTransportBlock();
     if (connectionChanged) {
         g_uiDirty = true;
     }
-
-    for (auto& fallback : g_disconnectFallbacks) {
-        if (!fallback.active) {
-            continue;
-        }
-        const std::uint16_t connectionHandle = fallback.connectionHandle;
-        fallback.active = false;
-        vibe::IngressMessage disconnect{};
-        disconnect.kind = vibe::IngressKind::Disconnect;
-        disconnect.connectionHandle = connectionHandle;
-        processIngressMessage(disconnect, nowMs);
-        Serial.printf("disconnect queue_full fallback handle=%u\n",
-                      connectionHandle);
-    }
-
-    for (auto& overflow : g_approvalOverflowNotices) {
-        if (!overflow.active) {
-            continue;
-        }
-        const std::uint16_t connectionHandle = overflow.connectionHandle;
-        overflow.active = false;
-        if (!queueProtocolError("", vibe::ProtocolErrorCode::QueueFull,
-                                "approval ingress queue is full",
-                                connectionHandle, nowMs)) {
-            Serial.printf("approval queue_full handle=%u\n",
-                          connectionHandle);
-        }
-    }
-}
-
-void recordDisconnectFallback(std::uint16_t connectionHandle) {
-    for (auto& fallback : g_disconnectFallbacks) {
-        if (!fallback.active) {
-            fallback.connectionHandle = connectionHandle;
-            fallback.active = true;
-            return;
-        }
-    }
-}
-
-void recordApprovalOverflow(std::uint16_t connectionHandle) {
-    for (auto& overflow : g_approvalOverflowNotices) {
-        if (!overflow.active) {
-            overflow.connectionHandle = connectionHandle;
-            overflow.active = true;
-            return;
-        }
+    if (pairingSuccess) {
+        playSe(1320.0f, 95);
+        vibrate(220, 75);
+        Serial.println("BLE pairing authenticated");
     }
 }
 
@@ -1166,7 +1332,7 @@ void recordApprovalOverflow(std::uint16_t connectionHandle) {
 class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* characteristic,
                  NimBLEConnInfo& connection) override {
-        const NimBLEAttValue value = characteristic->getValue();
+        const NimBLEAttValue& value = characteristic->getValue();
         const auto* data = value.data();
         const std::size_t length = value.size();
         if (data == nullptr || length < 2 || data[0] != vibe::kChannelJsonRpc) {
@@ -1178,8 +1344,14 @@ class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
             chunkLength > length - 2) {
             return;
         }
-        vibe::enqueueHidChunk(connection.getConnHandle(), data + 2,
-                              chunkLength);
+        const auto token = currentConnectionToken(connection.getConnHandle());
+        if (!token.active) {
+            return;
+        }
+        const auto result = vibe::enqueueHidChunk(
+            token.connectionHandle, token.connectionGeneration,
+            token.streamEpoch, data + 2, chunkLength);
+        publishHidEnqueueResult(token.connectionHandle, result);
     }
 };
 
@@ -1199,12 +1371,18 @@ class GattWriteCallbacks : public NimBLECharacteristicCallbacks {
             return;
         }
 
-        const NimBLEAttValue value = characteristic->getValue();
+        const auto token = currentConnectionToken(connection.getConnHandle());
+        if (!token.active) {
+            return;
+        }
+        const NimBLEAttValue& value = characteristic->getValue();
         const auto result = vibe::enqueueGattWrite(
-            kind_, connection.getConnHandle(), value.data(), value.size(), true);
+            kind_, token.connectionHandle, token.connectionGeneration,
+            value.data(), value.size(), true);
         if (kind_ == vibe::IngressKind::Approval &&
             result == vibe::EnqueueResult::QueueFull) {
-            recordApprovalOverflow(connection.getConnHandle());
+            publishApprovalOverflow(token.connectionHandle,
+                                    token.connectionGeneration);
         }
     }
 
@@ -1216,13 +1394,18 @@ class GattWriteCallbacks : public NimBLECharacteristicCallbacks {
 class ApprovalResultCallbacks : public NimBLECharacteristicCallbacks {
     void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo& connection,
                      std::uint16_t subscription) override {
-        updateApprovalSubscription(connection.getConnHandle(),
-                                   (subscription & 0x0002U) != 0);
+        publishApprovalSubscription(connection.getConnHandle(),
+                                    (subscription & 0x0002U) != 0);
     }
 
     void onStatus(NimBLECharacteristic*, int code) override {
-        g_indicationStatusCode = code;
-        g_indicationStatusPending = true;
+        portENTER_CRITICAL(&g_callbackStateMux);
+        if (g_callbackDeliveryId != 0) {
+            g_indicationStatusHandoff.pending = true;
+            g_indicationStatusHandoff.code = code;
+            g_indicationStatusHandoff.deliveryId = g_callbackDeliveryId;
+        }
+        portEXIT_CRITICAL(&g_callbackStateMux);
     }
 };
 
@@ -1230,19 +1413,18 @@ class ApprovalResultCallbacks : public NimBLECharacteristicCallbacks {
 // advertising automatically after a disconnect.
 class HidServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*, NimBLEConnInfo& connection) override {
-        updateCallbackConnection(connection.getConnHandle(), true);
+        publishConnectionConnected(connection.getConnHandle());
     }
 
     void onDisconnect(NimBLEServer*, NimBLEConnInfo& connection,
                       int reason) override {
+        const auto token = currentConnectionToken(connection.getConnHandle());
         const auto result = vibe::enqueueGattWrite(
-            vibe::IngressKind::Disconnect, connection.getConnHandle(),
-            nullptr, 0);
-        if (result != vibe::EnqueueResult::Accepted) {
-            recordDisconnectFallback(connection.getConnHandle());
-        }
-        updateCallbackConnection(connection.getConnHandle(), false);
-        updateApprovalSubscription(connection.getConnHandle(), false);
+            vibe::IngressKind::Disconnect, token.connectionHandle,
+            token.connectionGeneration, nullptr, 0);
+        publishConnectionDisconnected(
+            token.connectionHandle, token.connectionGeneration,
+            result != vibe::EnqueueResult::Accepted);
         (void)reason;
     }
 
@@ -1254,8 +1436,9 @@ class HidServerCallbacks : public NimBLEServerCallbacks {
         }
         // Defer hardware feedback to Arduino's main loop; NimBLE owns this
         // callback task and should only publish the successful result.
+        portENTER_CRITICAL(&g_callbackStateMux);
         g_pairingSuccessPending = true;
-        Serial.println("BLE pairing authenticated");
+        portEXIT_CRITICAL(&g_callbackStateMux);
     }
 };
 
@@ -2939,7 +3122,7 @@ void loop() {
     vibe::IngressMessage ingress;
     for (int processed = 0;
          processed < 4 && vibe::dequeueIngress(ingress); ++processed) {
-        processIngressMessage(ingress, millis());
+        processIngressMessage(ingress, ingressNow);
     }
     vibe::HidChunk chunk;
     for (int processed = 0;
@@ -2951,12 +3134,6 @@ void loop() {
     expirePendingApproval(ingressNow);
     handleTouch();
     handlePhysicalButtons();
-
-    if (g_pairingSuccessPending) {
-        g_pairingSuccessPending = false;
-        playSe(1320.0f, 95);
-        vibrate(220, 75);
-    }
 
     const std::uint32_t now = millis();
     if (g_lastActivityAt == 0) {
