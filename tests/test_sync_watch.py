@@ -172,9 +172,10 @@ class FakeBleakClient:
 
 
 class FakeBleakAdapter:
-    def __init__(self, client, device="pinned-device"):
+    def __init__(self, client, device="pinned-device", discovery_error=None):
         self._client = client
         self.device = device
+        self.discovery_error = discovery_error
         self.resolved = []
         self.demo_discoveries = 0
 
@@ -184,6 +185,8 @@ class FakeBleakAdapter:
 
     async def discover_demo(self):
         self.demo_discoveries += 1
+        if self.discovery_error is not None:
+            raise self.discovery_error
         return self.device
 
     def client(self, device):
@@ -419,6 +422,31 @@ def test_bleak_demo_reports_bindable_uuid_on_stderr_and_keeps_stdout_machine_jso
     assert adapter.demo_discoveries == 1
     assert client.events.count(("connect",)) == 1
     assert sum(event[0] == "write" for event in client.events) == 1
+
+
+def test_bleak_demo_no_device_is_labeled_before_demo_specific_failure(capsys):
+    adapter = FakeBleakAdapter(FakeBleakClient(), device=None)
+    request = sync_watch.build_request(sync_watch.parse_args(["--backend", "bleak", "--demo"]))
+
+    assert sync_watch.run_bleak(request, adapter) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "synthetic/demo" in captured.err.lower()
+    assert "demo discovery did not find" in captured.err.lower()
+    assert "pinned bluetooth device" not in captured.err.lower()
+
+
+def test_bleak_demo_discovery_exception_is_labeled_and_stdout_stays_empty(capsys):
+    adapter = FakeBleakAdapter(
+        FakeBleakClient(), discovery_error=Exception("bluetooth unavailable"),
+    )
+    request = sync_watch.build_request(sync_watch.parse_args(["--backend", "bleak", "--demo"]))
+
+    assert sync_watch.run_bleak(request, adapter) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "synthetic/demo" in captured.err.lower()
+    assert "bluetooth unavailable" in captured.err.lower()
 
 
 def test_help_lists_supported_modes_without_bootloader(capsys):

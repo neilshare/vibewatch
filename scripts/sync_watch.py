@@ -386,11 +386,16 @@ async def _run_bleak(
             "Automatic App Server quota is supported by the native backend; select --backend native.",
         )
     if isinstance(request, DemoDiscoveryRequest):
+        print("Synthetic/demo discovery mode: scanning for a nearby VibeWatch.", file=sys.stderr)
         device = await adapter.discover_demo()
+        if device is None:
+            raise TransportFailure(
+                "device_not_found", "Synthetic/demo discovery did not find a VibeWatch device."
+            )
     else:
         device = await adapter.resolve_pinned(request.device_id)
-    if device is None:
-        raise TransportFailure("device_not_found", "Pinned Bluetooth device was not found.")
+        if device is None:
+            raise TransportFailure("device_not_found", "Pinned Bluetooth device was not found.")
     if isinstance(request, DemoDiscoveryRequest):
         raw_identifier = getattr(device, "address", None)
         try:
