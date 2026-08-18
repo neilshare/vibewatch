@@ -38,7 +38,7 @@
 
 - **手势无缝切页**：向左/向右滑动屏幕即可流畅切卡，伴随清脆的 **1150Hz 切页音效** 与 **触觉轻震**。
 - **状态持久化 (NVS Memory)**：重启或断电后自动恢复停留在上次选定的智能体卡片。
-- **任务隔离机制**：三张卡片的 6 智能体环、麦克风拾音与审批事件各自携带上下文标识（如 `"c": "WORKBUDDY"`），杜绝跨系统串扰。
+- **任务隔离机制**：三张卡片的 6 智能体环、按住说话 HID 控制事件与审批事件各自携带上下文标识（如 `"c": "WORKBUDDY"`），杜绝跨系统串扰；手表不采集麦克风音频。
 
 ---
 
@@ -141,17 +141,17 @@ swift build --package-path companion -c release
 
 #### Python 同步脚本
 ```bash
-# 安装依赖
-pip install -r requirements.txt  # 或 pip install bleak pytest
+# 使用运行 CLI 的同一个 Python 安装实际依赖
+python3 -m pip install bleak pytest
 
 # 运行自动化单元测试
-pytest tests/
+python3 -m pytest tests/
 
 # 通过默认原生后端同步真实 Codex 额度
-python scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
+python3 scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
 
 # 显式使用 Python/Bleak 发送 v2 审批
-python scripts/sync_watch.py --backend bleak --approval \
+python3 scripts/sync_watch.py --backend bleak --approval \
   --summary "执行自动化测试脚本" \
   --device-id YOUR_COREBLUETOOTH_UUID
 ```

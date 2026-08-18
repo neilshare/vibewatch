@@ -38,7 +38,7 @@ Seamlessly navigate between three premier desktop AI coding agents with horizont
 
 - **Horizontal Swipe Navigation**: Swipe left or right across the screen with tactile haptic pulses and a crisp **1150Hz page chime**.
 - **NVS Memory Persistence**: Automatically preserves and restores your active agent card across device reboots and power cycles.
-- **Strict Task Isolation**: 6-agent status rings, push-to-talk mic, and approval actions are strictly tagged with the active system context (e.g. `"c": "WORKBUDDY"`), preventing cross-agent crosstalk.
+- **Strict Task Isolation**: 6-agent status rings, push-to-talk HID control events, and approval actions are strictly tagged with the active system context (e.g. `"c": "WORKBUDDY"`), preventing cross-agent crosstalk. The watch does not capture microphone audio.
 
 ---
 
@@ -142,17 +142,17 @@ swift build --package-path companion -c release
 
 #### Python CLI & Unit Tests
 ```bash
-# Install dependencies
-pip install pytest bleak
+# Install dependencies with the same Python used to run the CLI
+python3 -m pip install bleak pytest
 
 # Run automated unit test suite
-pytest tests/
+python3 -m pytest tests/
 
 # Automatically sync real local Codex quota through the native backend
-python scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
+python3 scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
 
 # Explicit Python/Bleak v2 approval transport
-python scripts/sync_watch.py --backend bleak --approval \
+python3 scripts/sync_watch.py --backend bleak --approval \
   --summary "Run automated test suite" \
   --device-id YOUR_COREBLUETOOTH_UUID
 ```

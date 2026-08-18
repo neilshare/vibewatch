@@ -127,9 +127,9 @@ In terminal A, start the first command and leave its modal open:
   --ttl-ms 120000 --device-id "$DEVICE_ID" --verbose
 ```
 
-While it remains open, run the same command in terminal B. It must not alert a
-second time or replay a decision to the retry. Then, still before deciding the
-original, run this different ID in terminal B:
+While it remains open, run the same command in terminal B and leave that retry
+waiting. It must not alert a second time or replay a decision. With both A and
+B still pending, run this different ID in terminal C:
 
 ```sh
 "$COMPANION" --approval \
@@ -138,9 +138,12 @@ original, run this different ID in terminal B:
   --ttl-ms 30000 --device-id "$DEVICE_ID" --verbose
 ```
 
-The second ID must return a v2 `busy` error and must not replace the first
-modal. Reject the original to finish terminal A. A retry process that receives
-no replay may end with its documented transport timeout.
+Terminal C must return a v2 `busy` error for the different ID and must not
+replace the first modal. After recording that result, interrupt terminal B with
+Control-C; it is expected to have received neither a decision nor a second
+alert. Finally, reject the original modal and verify that only terminal A
+receives its one matching decision. Leaving B uninterrupted is also valid, but
+it must end only with the documented transport timeout, never a replay.
 
 ### Short TTL expiry
 
@@ -190,14 +193,25 @@ HID action. It must not produce a v2 decision indication.
 
 ### 100-cycle soak
 
-Record the boot `VW_HEAP_DIAG` free-heap value from the serial monitor. Then run 100
-unique approvals, alternating approve and reject on the watch. At cycles 25,
-50, 75, and 100, disconnect while the modal is pending, reconnect, and continue
-with a new UUID. Full UUIDs stay in the temporary transcript only.
+Record the boot `VW_HEAP_DIAG` free-heap value from the serial monitor. The soak
+denominator is exactly 100 terminal protocol-v2 CLI attempts, each with a new
+`request_id` and the same pinned `DEVICE_ID`. For every non-disconnect cycle,
+approve odd cycle numbers and reject even cycle numbers. At cycles 25, 50, 75,
+and 100, disconnect while the modal is pending instead of deciding, wait for
+the expected host `transport_error`, reconnect the same pinned device, and
+continue. Full request UUIDs stay in the temporary transcript only.
 
 ```sh
 for CYCLE in $(seq 1 100); do
   REQUEST_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  if [ $((CYCLE % 25)) -eq 0 ]; then
+    EXPECTED='disconnect -> transport_error'
+  elif [ $((CYCLE % 2)) -eq 1 ]; then
+    EXPECTED='approve'
+  else
+    EXPECTED='reject'
+  fi
+  printf 'cycle=%03d expected=%s\n' "$CYCLE" "$EXPECTED"
   "$COMPANION" --approval --request-id "$REQUEST_ID" \
     --card codex --agent-id "$(( (CYCLE - 1) % 6 ))" \
     --type SOAK --summary "Approval soak cycle $CYCLE" \
@@ -205,11 +219,13 @@ for CYCLE in $(seq 1 100); do
 done 2>&1 | tee /tmp/vibewatch-approval-soak.txt
 ```
 
-Record the final `VW_HEAP_DIAG` sample after the last terminal outcome. PASS requires 100 terminal outcomes,
-no incorrect request correlation, no lost non-disconnect result, no replay,
-no stuck modal, no crash, no queue growth, and no material monotonic free-heap
-loss. Delete or securely retain the unsanitized temporary transcript according
-to local policy; do not commit it.
+Record the final `VW_HEAP_DIAG` sample after attempt 100 terminates. The exact
+PASS count is 48 delivered `approve` decisions + 48 delivered `reject`
+decisions + 4 expected disconnect `transport_error` failures = 100 terminal v2
+attempts, with 0 unexpected failures. PASS also requires no incorrect request
+correlation, replay, stuck modal, crash, queue growth, or material monotonic
+free-heap loss. Delete or securely retain the unsanitized temporary transcript
+according to local policy; do not commit it.
 
 ## Thirteen required acceptance cases
 
@@ -285,7 +301,7 @@ microphone audio.
 - Result: `<PASS|FAIL|BLOCKED>`
 - Start free heap: `<bytes and sanitized serial timestamp>`
 - End free heap: `<bytes and sanitized serial timestamp>`
-- Outcome counts: `<approve / reject / expected disconnect / unexpected failure>`
+- Outcome counts: `<48 approve / 48 reject / 4 expected disconnect transport_error / 0 unexpected failure>`
 - Evidence: `<no queue leak, material heap degradation, crash, or stuck modal>`
 
 ### 13. Agent labels are 2× and controls are unaffected
