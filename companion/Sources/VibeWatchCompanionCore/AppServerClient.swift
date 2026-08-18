@@ -5,14 +5,66 @@ public protocol AppServerServing: AnyObject {
     func readRateLimits() throws -> QuotaSnapshot
 }
 
+public final class AppServerResponseParser {
+    private var buffer = Data()
+    private var responses: [Int: [String: Any]] = [:]
+    public private(set) var failure: CompanionError?
+
+    public init() {}
+
+    public func consume(_ data: Data) {
+        guard failure == nil else { return }
+        guard !data.isEmpty else {
+            finish()
+            return
+        }
+        buffer.append(data)
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[..<newline])
+            buffer.removeSubrange(...newline)
+            parseLine(line)
+            if failure != nil { return }
+        }
+    }
+
+    public func finish() {
+        guard failure == nil else { return }
+        if !buffer.isEmpty {
+            let finalLine = buffer
+            buffer.removeAll(keepingCapacity: false)
+            parseLine(finalLine)
+        }
+        if failure == nil {
+            failure = .malformedRateLimits("Codex App Server 在返回匹配响应前结束输出")
+        }
+    }
+
+    public func takeResponse(id: Int) -> [String: Any]? {
+        responses.removeValue(forKey: id)
+    }
+
+    public func hasResponse(id: Int) -> Bool {
+        responses[id] != nil
+    }
+
+    private func parseLine(_ line: Data) {
+        guard !line.isEmpty else { return }
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            failure = .malformedRateLimits("Codex App Server 返回了无效 JSON")
+            return
+        }
+        guard let id = (object["id"] as? NSNumber)?.intValue else { return }
+        responses[id] = object
+    }
+}
+
 public final class AppServerClient: AppServerServing {
     private let process: Process?
     private let inputPipe: Pipe?
     private let outputPipe: Pipe?
     private let errorPipe: Pipe?
     private let condition = NSCondition()
-    private var receiveBuffer = Data()
-    private var responses: [Int: [String: Any]] = [:]
+    private let responseParser = AppServerResponseParser()
     private var stderrTail = ""
     private var nextID = 1
     private var lineInput: (() throws -> String?)?
@@ -170,14 +222,15 @@ public final class AppServerClient: AppServerServing {
     private func waitForResponse(id: Int, timeout: TimeInterval) throws -> [String: Any] {
         if let lineInput {
             while let line = try lineInput() {
-                guard let data = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw CompanionError.malformedRateLimits("Codex App Server 返回了无效 JSON")
-                }
-                guard let responseID = (object["id"] as? NSNumber)?.intValue else { continue }
-                if responseID == id { return object }
+                var data = Data(line.utf8)
+                if data.last != 0x0A { data.append(0x0A) }
+                responseParser.consume(data)
+                if let response = responseParser.takeResponse(id: id) { return response }
+                if let failure = responseParser.failure { throw failure }
             }
-            throw CompanionError.malformedRateLimits("Codex App Server 没有返回匹配的 rateLimits 响应")
+            responseParser.finish()
+            if let response = responseParser.takeResponse(id: id) { return response }
+            throw responseParser.failure ?? CompanionError.malformedRateLimits("Codex App Server 没有返回匹配的 rateLimits 响应")
         }
 
         guard let process else {
@@ -186,26 +239,26 @@ public final class AppServerClient: AppServerServing {
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         defer { condition.unlock() }
-        while responses[id] == nil, process.isRunning, Date() < deadline {
+        while responseParser.failure == nil,
+              !responseParser.hasResponse(id: id),
+              process.isRunning,
+              Date() < deadline {
             condition.wait(until: deadline)
         }
-        if let response = responses.removeValue(forKey: id) { return response }
+        if let response = responseParser.takeResponse(id: id) { return response }
+        if let failure = responseParser.failure { throw failure }
+        if !process.isRunning {
+            responseParser.finish()
+            if let response = responseParser.takeResponse(id: id) { return response }
+            if let failure = responseParser.failure { throw failure }
+        }
         let detail = stderrTail.isEmpty ? "无错误输出" : stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
         throw CompanionError.appServer("等待 Codex App Server 响应超时：\(detail)")
     }
 
     private func consume(_ data: Data) {
-        guard !data.isEmpty else { return }
         condition.lock()
-        receiveBuffer.append(data)
-        while let newline = receiveBuffer.firstIndex(of: 0x0A) {
-            let line = receiveBuffer[..<newline]
-            receiveBuffer.removeSubrange(...newline)
-            guard !line.isEmpty,
-                  let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let id = (object["id"] as? NSNumber)?.intValue else { continue }
-            responses[id] = object
-        }
+        responseParser.consume(data)
         condition.broadcast()
         condition.unlock()
     }

@@ -17,11 +17,16 @@ let package = Package(
         ),
         .testTarget(
             name: "VibeWatchCompanionCoreTests",
-            dependencies: ["VibeWatchCompanionCore"]
+            dependencies: ["VibeWatchCompanionCoreTestSupport"]
+        ),
+        .target(
+            name: "VibeWatchCompanionCoreTestSupport",
+            dependencies: ["VibeWatchCompanionCore"],
+            path: "Tests/VibeWatchCompanionCoreTestSupport"
         ),
         .executableTarget(
             name: "VibeWatchCompanionCoreVerification",
-            dependencies: ["VibeWatchCompanionCore"],
+            dependencies: ["VibeWatchCompanionCoreTestSupport"],
             path: "Tests/VibeWatchCompanionCoreVerification"
         ),
     ]

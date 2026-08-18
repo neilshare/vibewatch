@@ -10,9 +10,8 @@ NSApplication.shared.setActivationPolicy(.prohibited)
 
 do {
     let options = try CompanionOptions.parse(CommandLine.arguments)
-    let result = try Runner().run(options: options)
-    if !result.stdout.isEmpty {
-        print(result.stdout)
+    let result = try Runner(writer: LegacyBLEWriter()).run(options: options) { output in
+        print(output)
     }
     exit(Int32(result.exitCode))
 } catch {
