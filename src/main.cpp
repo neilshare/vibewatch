@@ -660,13 +660,19 @@ void sendConsumerKey(uint16_t keycode, bool pressed) {
 
 void sendAgentEvent(int index, bool pressed) {
     char key[5];
-    std::snprintf(key, sizeof(key), "AG%02d", index);
+    std::snprintf(key, sizeof(key), "AG%02d", index + 1); // 1-indexed: AG01..AG06 for Codex and agents
     sendKeyEvent(key, pressed);
 
-    // Standard BLE HID Key: Send safe function keys F13..F18 (0x68..0x6D)
-    // NEVER emits ASCII digits '1'..'6' into user chat dialogs!
+    // Standard BLE HID Key:
+    // - Workbuddy & AntiGravity: Cmd + 1..6 (0x08 = Left GUI / Command, 0x1E..0x23 = '1'..'6')
+    //   Switches IDE / application tab & agent view without polluting chat textboxes.
+    // - Codex: Function keys F13..F18 (0x68..0x6D)
     if (index >= 0 && index < 6) {
-        sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
+        if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
+            sendStandardKeyboardKey(0x08, 0x1E + index, pressed); // Cmd + 1..6
+        } else {
+            sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
+        }
     }
 }
 
@@ -686,11 +692,9 @@ void sendActionEvent(int index, bool pressed) {
         sendStandardKeyboardKey(0x00, 0x70, pressed); // F21
     } else if (index == 12) { // AI assistant single tap
         if (g_currentCard == CARD_ANTIGRAVITY) {
-            // Antigravity prompt focus: send Return or standard Enter
-            sendStandardKeyboardKey(0x00, 0x28, pressed);
+            sendStandardKeyboardKey(0x00, 0x28, pressed); // Return / Enter
         } else if (g_currentCard == CARD_WORKBUDDY) {
-            // Workbuddy single click: send Return or standard Enter
-            sendStandardKeyboardKey(0x00, 0x28, pressed);
+            sendStandardKeyboardKey(0x00, 0x28, pressed); // Return / Enter
         } else {
             sendStandardKeyboardKey(0x00, 0x71, pressed); // F22
         }
@@ -698,15 +702,15 @@ void sendActionEvent(int index, bool pressed) {
 }
 
 void sendMicEvent(bool pressed) {
-    sendActionEvent(10, pressed);
-    // NimBLE notifications are asynchronous. Pace the paired MIC reports so
-    // ACT11 cannot overwrite ACT10 in the controller buffer before delivery.
-    delay(12);
-    sendActionEvent(11, pressed);
-
-    // Dedicated Voice Dictation without interfering with third-party app shortcuts:
-    // Only send the dedicated vendor channel ACT10/11 + standard F19
-    sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (safe function key)
+    if (pressed) {
+        // PTT Start (Hold down): sends ACT10 + F19 Key Down
+        sendActionEvent(10, true);
+        sendStandardKeyboardKey(0x00, 0x6E, true); // F19 (macOS Dictation)
+    } else {
+        // PTT End (Release): sends ACT11 + F19 Key Up
+        sendActionEvent(11, true);
+        sendStandardKeyboardKey(0x00, 0x6E, false); // F19 Key Up
+    }
 }
 
 void sendJoystickEvent(float angle, float distance) {
