@@ -658,18 +658,26 @@ void sendConsumerKey(uint16_t keycode, bool pressed) {
     g_consumerInput->notify();
 }
 
+void sendStandardKeyboardStroke(uint8_t modifiers, uint8_t keycode) {
+    sendStandardKeyboardKey(modifiers, keycode, true);
+    delay(30);
+    sendStandardKeyboardKey(modifiers, keycode, false);
+}
+
 void sendAgentEvent(int index, bool pressed) {
     char key[5];
     std::snprintf(key, sizeof(key), "AG%02d", index + 1); // 1-indexed: AG01..AG06 for Codex and agents
     sendKeyEvent(key, pressed);
 
-    // Standard BLE HID Key:
-    // - Workbuddy & AntiGravity: Cmd + 1..6 (0x08 = Left GUI / Command, 0x1E..0x23 = '1'..'6')
-    //   Switches IDE / application tab & agent view without polluting chat textboxes.
+    // Option A: Switch Sidebar Conversation / Session List 1..6
+    // - Workbuddy & AntiGravity: Cmd + Option + 1..6 (0x0C = Left GUI + Left Option, 0x1E..0x23 = '1'..'6')
+    //   Directly targets sidebar conversation sessions without polluting input boxes or editor panes.
     // - Codex: Function keys F13..F18 (0x68..0x6D)
     if (index >= 0 && index < 6) {
         if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
-            sendStandardKeyboardKey(0x08, 0x1E + index, pressed); // Cmd + 1..6
+            if (pressed) {
+                sendStandardKeyboardStroke(0x0C, 0x1E + index); // Cmd + Option + 1..6 (Sidebar Session Switch)
+            }
         } else {
             sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
         }
