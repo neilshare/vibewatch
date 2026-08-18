@@ -107,6 +107,7 @@ String g_focusedApp;
 NimBLEServer* g_server = nullptr;
 NimBLEHIDDevice* g_hid = nullptr;
 NimBLECharacteristic* g_keyboardInput = nullptr;
+NimBLECharacteristic* g_consumerInput = nullptr;
 NimBLECharacteristic* g_vendorInput = nullptr;
 NimBLECharacteristic* g_vendorOutput = nullptr;
 NimBLECharacteristic* g_approvalResult = nullptr;
@@ -644,6 +645,19 @@ void sendKeyEvent(const char* key, bool pressed) {
     Serial.printf("HID %s %s [%s] len=%d\n", key, pressed ? "DOWN" : "UP", g_cards[g_currentCard].name, written);
 }
 
+void sendConsumerKey(uint16_t keycode, bool pressed) {
+    if (!g_connected || g_consumerInput == nullptr) {
+        return;
+    }
+    uint8_t report[2] = {};
+    if (pressed) {
+        report[0] = static_cast<uint8_t>(keycode & 0xFF);
+        report[1] = static_cast<uint8_t>((keycode >> 8) & 0xFF);
+    }
+    g_consumerInput->setValue(report, sizeof(report));
+    g_consumerInput->notify();
+}
+
 void sendAgentEvent(int index, bool pressed) {
     char key[5];
     std::snprintf(key, sizeof(key), "AG%02d", index);
@@ -673,11 +687,13 @@ void sendActionEvent(int index, bool pressed) {
         sendStandardKeyboardKey(0x00, 0x6F, pressed); // F20
     } else if (index == 9) { // PLAN (6 + 3)
         sendStandardKeyboardKey(0x00, 0x70, pressed); // F21
-    } else if (index == 12) { // AI assistant click
+    } else if (index == 12) { // AI assistant single tap
         if (g_currentCard == CARD_ANTIGRAVITY) {
-            sendStandardKeyboardKey(0x08, 0x0E, pressed); // Cmd + K (Antigravity Prompt)
+            sendConsumerKey(0x00CF, pressed); // Voice Command / Dictation
+            sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS Global Dictation Hotkey)
         } else if (g_currentCard == CARD_WORKBUDDY) {
-            sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space (Workbuddy Voice/Assistant)
+            sendConsumerKey(0x00CF, pressed); // Voice Command / Dictation
+            sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space
         } else {
             sendStandardKeyboardKey(0x00, 0x71, pressed); // F22
         }
@@ -691,14 +707,10 @@ void sendMicEvent(bool pressed) {
     delay(12);
     sendActionEvent(11, pressed);
 
-    // Standard BLE HID Key for Voice / Assistant Dictation:
-    if (g_currentCard == CARD_WORKBUDDY) {
-        sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space (Workbuddy Voice/Assistant)
-    } else if (g_currentCard == CARD_ANTIGRAVITY) {
-        sendStandardKeyboardKey(0x08, 0x0E, pressed); // Cmd + K (Antigravity Prompt)
-    } else {
-        sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS Dictation / Codex Assistant)
-    }
+    // Standard Voice Dictation: Consumer Voice Command (0x00CF) + F19 (macOS Dictation)
+    // Avoids unintended Command+N / Command+K window spawns!
+    sendConsumerKey(0x00CF, pressed);
+    sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS standard dictation trigger)
 }
 
 void sendJoystickEvent(float angle, float distance) {
@@ -1633,7 +1645,7 @@ void initializeBle() {
     addDeviceInfoCharacteristic(0x2A26, vibe::kFirmwareVersion);
 
     g_keyboardInput = g_hid->getInputReport(1);
-    auto* consumerInput = g_hid->getInputReport(2);
+    g_consumerInput = g_hid->getInputReport(2);
     auto* pointerInput = g_hid->getInputReport(3);
     g_vendorInput = g_hid->getInputReport(vibe::kVendorReportId);
     auto* vendorOutput = addNoCopyCharacteristic(
@@ -1660,7 +1672,9 @@ void initializeBle() {
     if (g_keyboardInput != nullptr) {
         g_keyboardInput->setValue(keyboardIdle, sizeof(keyboardIdle));
     }
-    consumerInput->setValue(consumerIdle, sizeof(consumerIdle));
+    if (g_consumerInput != nullptr) {
+        g_consumerInput->setValue(consumerIdle, sizeof(consumerIdle));
+    }
     pointerInput->setValue(pointerIdle, sizeof(pointerIdle));
     g_vendorInput->setValue(vendorIdle, sizeof(vendorIdle));
     g_vendorOutput->setCallbacks(&g_rpcCallbacks);
