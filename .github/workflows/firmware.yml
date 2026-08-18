@@ -1,4 +1,4 @@
-name: Firmware build
+name: Firmware and host checks
 
 on:
   push:
@@ -21,8 +21,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PlatformIO
-        run: python -m pip install platformio==6.1.18
+      - name: Install test and build tools
+        run: python -m pip install platformio==6.1.18 pytest
+
+      - name: Reject tracked generated Python files
+        run: test -z "$(git ls-files | grep -E '(^|/)__pycache__/|\.pyc$' || true)"
+
+      - name: Test Python host tools
+        run: python -m pytest -q
+
+      - name: Test portable firmware core
+        run: python -m platformio test -e native
 
       - name: Build Vibe Watch firmware
         run: python -m platformio run -e m5stack-stopwatch

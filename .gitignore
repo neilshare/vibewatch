@@ -10,3 +10,6 @@ compile_commands.json
 companion/.build/
 companion/.swiftpm/
 .superpowers/
+__pycache__/
+*.py[cod]
+.pytest_cache/

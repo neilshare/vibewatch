@@ -1,0 +1,26 @@
+name: Companion checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Test companion
+        run: swift test --package-path companion
+
+      - name: Build release companion
+        run: swift build -c release --package-path companion
