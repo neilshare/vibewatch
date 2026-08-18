@@ -27,7 +27,7 @@ public enum Task4Scenarios {
             return 7
         case .approvalTransportAndRunner:
             try runApprovalTransportAndRunnerScenarios()
-            return 8
+            return 13
         }
     }
 
@@ -204,6 +204,30 @@ public enum Task4Scenarios {
         try check(emittedBeforeCompletion == [true, true], "watch output was buffered until completion")
         try check(result.stdout.isEmpty, "watch output accumulated in CommandResult storage")
         try check(writer.quotaWrites == 2 && waits == 1, "finite watch loop did not perform two writes and one wait")
+
+        let demoOptions = try CompanionOptions.parse([
+            "tool", "--demo", "--watch", "--interval", "10",
+        ])
+        let demoDeviceID = UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!
+        let demoTransport = DemoRecordingTransport(deviceID: demoDeviceID)
+        var demoEmitted: [String] = []
+        var demoProgress: [String] = []
+        var demoWaits = 0
+        let demoRunner = Runner(
+            transport: demoTransport,
+            wait: { _ in demoWaits += 1 },
+            shouldContinueWatching: { completedIterations in completedIterations < 2 },
+            progress: { demoProgress.append($0) }
+        )
+        let demoResult = try demoRunner.run(options: demoOptions) { demoEmitted.append($0) }
+        try check(demoTransport.discoveryCount == 1, "demo watch rediscovered on every iteration")
+        try check(demoTransport.deviceIDs == [demoDeviceID, demoDeviceID], "demo watch did not stay pinned after discovery")
+        try check(demoEmitted.count == 2 && demoWaits == 1, "demo watch did not stream two writes with one wait")
+        try check(demoResult.stdout.isEmpty, "demo watch accumulated final stdout")
+        try check(
+            demoProgress.count == 1 && demoProgress[0].lowercased().contains("demo"),
+            "demo discovery was not clearly labeled through the non-verbose progress sink"
+        )
     }
 
     private static func runApprovalTransportAndRunnerScenarios() throws {
@@ -240,8 +264,39 @@ public enum Task4Scenarios {
         try check(matcher.receive(try encoder.encode(mismatch)) == nil, "mismatched indication was delivered")
         let matching = ApprovalDecisionV2(requestID: requestID, decision: .approve, decidedAtMs: 2)
         let matchingData = try encoder.encode(matching)
-        try check(matcher.receive(matchingData) == matching, "matching indication was not delivered")
+        try check(matcher.receive(matchingData) == .decision(matching), "matching indication was not delivered")
         try check(matcher.receive(matchingData) == nil, "duplicate indication was delivered twice")
+
+        let unrelatedError = ApprovalProtocolErrorV2(
+            requestID: otherID, code: "busy", message: "Another approval is pending."
+        )
+        let errorMatcher = ApprovalResultMatcher(requestID: requestID)
+        try check(
+            errorMatcher.receive(try encoder.encode(unrelatedError)) == nil,
+            "protocol error for an unrelated request was delivered"
+        )
+        let matchingError = ApprovalProtocolErrorV2(
+            requestID: requestID, code: "busy", message: "Another approval is pending."
+        )
+        try check(
+            errorMatcher.receive(try encoder.encode(matchingError)) == .protocolError(matchingError),
+            "matching firmware protocol error was not delivered immediately"
+        )
+
+        for (code, message) in [
+            ("busy", "Another approval is pending."),
+            ("queue_full", "Approval queue is full."),
+        ] {
+            let firmwareFailure = FakeTransport(
+                approvalResult: .failure(BLETransportError.protocolError(code: code, message: message))
+            )
+            let firmwareResult = try Runner(transport: firmwareFailure).run(options: options) { _ in }
+            try check(firmwareResult.exitCode == 1, "firmware \(code) error did not fail immediately")
+            try check(
+                firmwareResult.stdout == #"{"code":"\#(code)","kind":"error","message":"\#(message)","version":2}"#,
+                "firmware \(code) code/message were not preserved"
+            )
+        }
 
         let timeout = FakeTransport(approvalResult: .failure(BLETransportError.timeout))
         let timeoutResult = try Runner(transport: timeout).run(options: options) { _ in }
@@ -356,5 +411,28 @@ private final class FakeTransport: BLETransporting {
         requestedApprovals.append(request)
         deviceIDs.append(deviceID)
         return try approvalResult.get()
+    }
+}
+
+private final class DemoRecordingTransport: BLETransporting {
+    let deviceID: UUID
+    var discoveryCount = 0
+    var deviceIDs: [UUID] = []
+
+    init(deviceID: UUID) {
+        self.deviceID = deviceID
+    }
+
+    func discoverDemoDevices() throws -> [UUID] {
+        discoveryCount += 1
+        return [deviceID]
+    }
+
+    func writeQuota(_ snapshot: QuotaSnapshot, deviceID: UUID) throws {
+        deviceIDs.append(deviceID)
+    }
+
+    func requestApproval(_ request: ApprovalRequestV2, deviceID: UUID) throws -> ApprovalDecisionV2 {
+        throw BLETransportError.transport("unexpected approval")
     }
 }

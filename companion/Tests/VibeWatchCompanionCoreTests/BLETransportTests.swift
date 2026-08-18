@@ -3,7 +3,7 @@ import XCTest
 import VibeWatchCompanionCoreTestSupport
 
 final class BLETransportTests: XCTestCase {
-    func testSharedApprovalTransportScenarios() throws {
+    func testSharedApprovalDecisionAndProtocolErrorScenarios() throws {
         try Task4Scenarios.run(.approvalTransportAndRunner)
     }
 }

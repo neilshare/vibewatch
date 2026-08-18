@@ -10,10 +10,11 @@ NSApplication.shared.setActivationPolicy(.prohibited)
 
 do {
     let options = try CompanionOptions.parse(CommandLine.arguments)
-    let transport = BLETransport(verbose: options.verbose) { progress in
-        fputs("\(progress)\n", stderr)
+    let reportProgress: (String) -> Void = { message in
+        fputs("\(message)\n", stderr)
     }
-    let result = try Runner(transport: transport).run(options: options) { output in
+    let transport = BLETransport(verbose: options.verbose, progress: reportProgress)
+    let result = try Runner(transport: transport, progress: reportProgress).run(options: options) { output in
         print(output)
     }
     if !result.stdout.isEmpty { print(result.stdout) }

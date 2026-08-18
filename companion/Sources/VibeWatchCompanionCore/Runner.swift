@@ -57,6 +57,7 @@ public final class Runner: CommandRunner {
     private let transport: any BLETransporting
     private let wait: (TimeInterval) -> Void
     private let shouldContinueWatching: (Int) -> Bool
+    private let progress: (String) -> Void
 
     public init(
         appServerFactory: @escaping (String) throws -> AppServerServing = { try AppServerClient(codexPath: $0) },
@@ -64,12 +65,14 @@ public final class Runner: CommandRunner {
         wait: @escaping (TimeInterval) -> Void = { interval in
             RunLoop.current.run(until: Date().addingTimeInterval(interval))
         },
-        shouldContinueWatching: @escaping (Int) -> Bool = { _ in true }
+        shouldContinueWatching: @escaping (Int) -> Bool = { _ in true },
+        progress: @escaping (String) -> Void = { _ in }
     ) {
         self.appServerFactory = appServerFactory
         self.transport = transport
         self.wait = wait
         self.shouldContinueWatching = shouldContinueWatching
+        self.progress = progress
     }
 
     public func run(options: CompanionOptions, emit: (String) -> Void) throws -> CommandResult {
@@ -118,10 +121,15 @@ public final class Runner: CommandRunner {
             return CommandResult(stdout: MachineOutput.encode(snapshot))
 
         case .demo(let snapshot):
+            progress("Demo discovery mode: writing synthetic quota snapshots.")
             let devices = try transport.discoverDemoDevices()
             guard let deviceID = devices.first else { throw BLETransportError.deviceNotFound }
-            try transport.writeQuota(snapshot, deviceID: deviceID)
-            return CommandResult(stdout: MachineOutput.encode(snapshot))
+            return try runDemoQuotaLoop(
+                snapshot: snapshot,
+                deviceID: deviceID,
+                options: options,
+                emit: emit
+            )
 
         case .automaticQuota:
             let client = try appServerFactory(options.codexPath)
@@ -155,6 +163,24 @@ public final class Runner: CommandRunner {
             wait(options.interval)
         } while true
         return CommandResult(stdout: options.watch ? "" : lastJSON)
+    }
+
+    private func runDemoQuotaLoop(
+        snapshot: QuotaSnapshot,
+        deviceID: UUID,
+        options: CompanionOptions,
+        emit: (String) -> Void
+    ) throws -> CommandResult {
+        let json = MachineOutput.encode(snapshot)
+        var completedIterations = 0
+        repeat {
+            try transport.writeQuota(snapshot, deviceID: deviceID)
+            completedIterations += 1
+            if options.watch { emit(json) }
+            guard options.watch, shouldContinueWatching(completedIterations) else { break }
+            wait(options.interval)
+        } while true
+        return CommandResult(stdout: options.watch ? "" : json)
     }
 
     private func applyOverrides(to snapshot: inout QuotaSnapshot, options: CompanionOptions) {

@@ -27,6 +27,7 @@ public extension BLETransporting {
 public enum BLETransportError: Error, Equatable, LocalizedError {
     case deviceNotFound
     case timeout
+    case protocolError(code: String, message: String)
     case transport(String)
 
     public var errorDescription: String? {
@@ -35,6 +36,8 @@ public enum BLETransportError: Error, Equatable, LocalizedError {
             return "Pinned Bluetooth device was not found."
         case .timeout:
             return "Timed out waiting for a matching approval decision."
+        case .protocolError(_, let message):
+            return message
         case .transport(let message):
             return message
         }
@@ -43,9 +46,15 @@ public enum BLETransportError: Error, Equatable, LocalizedError {
     public var code: String {
         switch self {
         case .deviceNotFound: return "device_not_found"
+        case .protocolError(let code, _): return code
         case .timeout, .transport: return "transport_error"
         }
     }
+}
+
+public enum ApprovalIndicationV2: Equatable, Sendable {
+    case decision(ApprovalDecisionV2)
+    case protocolError(ApprovalProtocolErrorV2)
 }
 
 public final class ApprovalResultMatcher {
@@ -57,16 +66,30 @@ public final class ApprovalResultMatcher {
         self.requestID = requestID
     }
 
-    public func receive(_ data: Data) -> ApprovalDecisionV2? {
+    public func receive(_ data: Data) -> ApprovalIndicationV2? {
+        struct Envelope: Decodable {
+            let version: Int
+            let kind: String
+        }
         guard !delivered,
-              let decision = try? decoder.decode(ApprovalDecisionV2.self, from: data),
-              decision.version == 2,
-              decision.kind == "approval_decision",
-              decision.requestID == requestID else {
+              let envelope = try? decoder.decode(Envelope.self, from: data),
+              envelope.version == 2 else { return nil }
+
+        let indication: ApprovalIndicationV2
+        switch envelope.kind {
+        case "approval_decision":
+            guard let decision = try? decoder.decode(ApprovalDecisionV2.self, from: data),
+                  decision.requestID == requestID else { return nil }
+            indication = .decision(decision)
+        case "error":
+            guard let error = try? decoder.decode(ApprovalProtocolErrorV2.self, from: data),
+                  error.requestID == requestID else { return nil }
+            indication = .protocolError(error)
+        default:
             return nil
         }
         delivered = true
-        return decision
+        return indication
     }
 }
 
@@ -398,9 +421,14 @@ private final class PinnedBLESession: NSObject, CBCentralManagerDelegate, CBPeri
             finish(.failure(BLETransportError.transport(errorMessage("Approval-result indication failed", error))))
             return
         }
-        guard let data = characteristic.value, let decision = matcher?.receive(data) else { return }
-        pendingDecision = decision
-        if writeAcknowledged { finish(.success(decision)) }
+        guard let data = characteristic.value, let indication = matcher?.receive(data) else { return }
+        switch indication {
+        case .decision(let decision):
+            pendingDecision = decision
+            if writeAcknowledged { finish(.success(decision)) }
+        case .protocolError(let error):
+            finish(.failure(BLETransportError.protocolError(code: error.code, message: error.message)))
+        }
     }
 
     private func use(_ selected: CBPeripheral, central: CBCentralManager) {

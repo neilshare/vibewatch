@@ -141,3 +141,67 @@ public struct ApprovalDecisionV2: Codable, Equatable, Sendable {
         decidedAtMs = try values.decode(UInt32.self, forKey: .decidedAtMs)
     }
 }
+
+public struct ApprovalProtocolErrorV2: Codable, Equatable, Sendable {
+    public let version: Int
+    public let kind: String
+    public let requestID: UUID?
+    public let code: String
+    public let message: String
+
+    public init(
+        version: Int = 2,
+        kind: String = "error",
+        requestID: UUID?,
+        code: String,
+        message: String
+    ) {
+        self.version = version
+        self.kind = kind
+        self.requestID = requestID
+        self.code = code
+        self.message = message
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case version, kind, code, message
+        case requestID = "request_id"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(version, forKey: .version)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(requestID?.uuidString.lowercased() ?? "", forKey: .requestID)
+        try values.encode(code, forKey: .code)
+        try values.encode(message, forKey: .message)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        kind = try values.decode(String.self, forKey: .kind)
+        guard version == 2, kind == "error" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: values,
+                debugDescription: "expected error version 2"
+            )
+        }
+        let rawID = try values.decode(String.self, forKey: .requestID)
+        if rawID.isEmpty {
+            requestID = nil
+        } else {
+            guard rawID == rawID.lowercased(), let decodedID = UUID(uuidString: rawID) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .requestID,
+                    in: values,
+                    debugDescription: "request_id must be empty or a canonical lowercase UUID"
+                )
+            }
+            requestID = decodedID
+        }
+        code = try values.decode(String.self, forKey: .code)
+        message = try values.decode(String.self, forKey: .message)
+    }
+}
