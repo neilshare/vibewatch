@@ -99,25 +99,36 @@ def parser() -> RaisingArgumentParser:
         description="Sync quota data or send a transactional approval to VibeWatch",
         add_help=False,
     )
-    result.add_argument("-h", "--help", action="store_true")
-    result.add_argument("--backend", choices=[item.value for item in Backend], default=Backend.NATIVE.value)
-    result.add_argument("--remaining")
-    result.add_argument("--reset")
-    result.add_argument("--auto", action="store_true")
-    result.add_argument("--demo", action="store_true")
-    result.add_argument("--approval", action="store_true")
-    result.add_argument("--card", "--agent")
-    result.add_argument("--credits", "--credit", "--balance")
-    result.add_argument("--total-credits", "--total")
-    result.add_argument("--request-id")
-    result.add_argument("--agent-id", default="0")
-    result.add_argument("--type", dest="operation_type", default="EXEC")
-    result.add_argument("--summary", default="Run Command")
-    result.add_argument("--ttl-ms", default="30000")
-    result.add_argument("--legacy-approval", action="store_true")
-    result.add_argument("--device-id")
-    result.add_argument("--codex-path")
-    result.add_argument("-v", "--verbose", action="store_true")
+    result.add_argument("-h", "--help", action="store_true", help="show this help and exit")
+    result.add_argument(
+        "--backend", choices=[item.value for item in Backend], default=Backend.NATIVE.value,
+        help="explicit transport backend (default: native; automatic quota is native-only)",
+    )
+    result.add_argument("--remaining", help="manual remaining percentage, requires --reset")
+    result.add_argument("--reset", help="manual reset interval in seconds, requires --remaining")
+    result.add_argument("--auto", action="store_true", help="read App Server quota through the native backend")
+    result.add_argument(
+        "--demo", action="store_true",
+        help="send synthetic quota using broad discovery and report the selected UUID",
+    )
+    result.add_argument("--approval", action="store_true", help="send an approval request")
+    result.add_argument("--card", "--agent", help="target card: codex, workbuddy, or antigravity")
+    result.add_argument("--credits", "--credit", "--balance", help="current credit balance")
+    result.add_argument("--total-credits", "--total", help="positive total credit balance")
+    result.add_argument("--request-id", help="canonical lowercase approval request UUID")
+    result.add_argument("--agent-id", default="0", help="approval agent slot, 0 through 5")
+    result.add_argument("--type", dest="operation_type", default="EXEC", help="approval operation type")
+    result.add_argument("--summary", default="Run Command", help="approval summary")
+    result.add_argument("--ttl-ms", default="30000", help="approval TTL, 5000 through 120000 ms")
+    result.add_argument(
+        "--legacy-approval", action="store_true",
+        help="use the explicit one-release approval compatibility payload",
+    )
+    result.add_argument(
+        "--device-id", help="pinned CoreBluetooth UUID required by every real operation",
+    )
+    result.add_argument("--codex-path", help="native automatic-quota Codex executable")
+    result.add_argument("-v", "--verbose", action="store_true", help="show additional progress on stderr")
     return result
 
 
@@ -375,12 +386,25 @@ async def _run_bleak(
             "Automatic App Server quota is supported by the native backend; select --backend native.",
         )
     if isinstance(request, DemoDiscoveryRequest):
-        print("Demo discovery mode: selecting a nearby VibeWatch.", file=sys.stderr)
         device = await adapter.discover_demo()
     else:
         device = await adapter.resolve_pinned(request.device_id)
     if device is None:
         raise TransportFailure("device_not_found", "Pinned Bluetooth device was not found.")
+    if isinstance(request, DemoDiscoveryRequest):
+        raw_identifier = getattr(device, "address", None)
+        try:
+            selected_id = str(UUID(str(raw_identifier)))
+        except (ValueError, TypeError) as error:
+            raise TransportFailure(
+                "transport_error",
+                "Synthetic/demo discovery selected a device without a bindable CoreBluetooth UUID.",
+            ) from error
+        print(
+            f"Synthetic/demo discovery selected device UUID {selected_id}; "
+            f"use --device-id {selected_id} for a real operation.",
+            file=sys.stderr,
+        )
 
     delivered_decision: dict[str, Any] | None = None
     client_context = adapter.client(device)

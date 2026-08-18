@@ -191,6 +191,11 @@ class FakeBleakAdapter:
         return self._client
 
 
+class FakeDevice:
+    def __init__(self, address):
+        self.address = address
+
+
 def test_bleak_manual_quota_uses_exact_device_schema_and_write_response(capsys):
     client = FakeBleakClient()
     adapter = FakeBleakAdapter(client)
@@ -390,11 +395,45 @@ def test_bleak_legacy_approval_is_ack_only_on_new_characteristic(capsys):
 
 def test_demo_is_the_only_bleak_mode_using_broad_discovery():
     client = FakeBleakClient()
-    adapter = FakeBleakAdapter(client)
+    adapter = FakeBleakAdapter(client, device=FakeDevice(VALID_UUID))
     request = sync_watch.build_request(sync_watch.parse_args(["--backend", "bleak", "--demo"]))
     assert sync_watch.run_bleak(request, adapter) == 0
     assert adapter.resolved == []
     assert adapter.demo_discoveries == 1
+
+
+def test_bleak_demo_reports_bindable_uuid_on_stderr_and_keeps_stdout_machine_json(capsys):
+    client = FakeBleakClient()
+    device = FakeDevice(VALID_UUID.upper())
+    adapter = FakeBleakAdapter(client, device=device)
+    request = sync_watch.build_request(sync_watch.parse_args(["--backend", "bleak", "--demo"]))
+
+    assert sync_watch.run_bleak(request, adapter) == 0
+    captured = capsys.readouterr()
+    assert "synthetic/demo" in captured.err.lower()
+    assert VALID_UUID in captured.err
+    assert json.loads(captured.out) == {
+        "remaining_percent": 59.0,
+        "reset_in_seconds": 3600,
+    }
+    assert adapter.demo_discoveries == 1
+    assert client.events.count(("connect",)) == 1
+    assert sum(event[0] == "write" for event in client.events) == 1
+
+
+def test_help_lists_supported_modes_without_bootloader(capsys):
+    assert sync_watch.main(["--help"]) == 0
+    help_text = capsys.readouterr().out
+    for flag in (
+        "--backend {native,bleak}", "--auto", "--remaining", "--reset",
+        "--demo", "--approval", "--device-id", "--legacy-approval",
+    ):
+        assert flag in help_text
+    assert "default: native" in help_text.lower()
+    assert "synthetic" in help_text.lower()
+    assert "broad discovery" in help_text.lower()
+    assert "real operation" in " ".join(help_text.lower().split())
+    assert "bootloader" not in help_text.lower()
 
 
 def test_missing_pinned_bleak_device_is_nonzero(capsys):
