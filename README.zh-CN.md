@@ -60,9 +60,9 @@
 
 ---
 
-### 3. 六子任务环形槽位 & 腕上语音输入 (6-Agent Ring & Push-to-Talk)
+### 3. 六子任务环形槽位 & 按住说话控制 (6-Agent Ring & Push-to-Talk)
 - **6 环形槽位**：围绕 AMOLED 表盘分布 6 个子任务节点，通过脉冲呼吸灯直观展示各子任务的运行/闲置/完成状态。
-- **中心语音拾音 (PTT Mic)**：在任意界面长按中心麦克风区域（或长按右侧物理按键），立即向当前智能体发送语音指令。
+- **中心 PTT 控制**：长按中心区域（或长按右侧物理按键）会向当前智能体发送按住说话 HID 控制事件。本固件不采集或传输麦克风音频。
 
 ---
 
@@ -97,7 +97,7 @@ git clone https://github.com/neilshare/vibewatch.git
 cd vibewatch
 
 # 2. 编译并烧录固件至手表
-platformio run --target upload
+platformio run -e m5stack-stopwatch --target upload
 ```
 
 ---
@@ -106,7 +106,8 @@ platformio run --target upload
 
 1. 点击表盘左下角的 **设置 (Settings)** 图标进入设置菜单。
 2. 选择设备槽位（如 Slot 1），点击 **PAIR** 开启配对广播。
-3. 打开电脑蓝牙设置，连接名为 `Vibe Watch #1` 的蓝牙设备。
+3. 打开 Mac 蓝牙设置，连接名为 `Vibe Watch #1` 的蓝牙设备。
+4. 妥善保存该设备在本机上的 CoreBluetooth UUID。下面每一个真实写入命令都必须把准确值作为 `YOUR_COREBLUETOOTH_UUID` 传入，且不要提交到代码仓库。
 
 ---
 
@@ -116,16 +117,26 @@ platformio run --target upload
 已为 macOS 编写了基于原生 CoreBluetooth 的伴侣工具，即使已作为 HID 键盘连接也能实现即时 GATT 写入：
 
 ```bash
-cd companion && swift build
+swift build --package-path companion -c release
 
-# 向当前卡片写入额度数据
-./.build/debug/CodexWatchCompanion --card codex
+# 仅用于演示的发现模式：广泛发现附近手表，写入合成额度，
+# 并在 stderr 报告所选 CoreBluetooth UUID
+./companion/.build/release/codex-watch-companion --demo --verbose
 
-# 向 Workbuddy 同步专属 Credit 点数
-./.build/debug/CodexWatchCompanion --card workbuddy --credits 1250 --total-credits 1500
+# 把真实 Codex 额度同步到准确绑定的手表
+./companion/.build/release/codex-watch-companion --auto --card codex \
+  --device-id YOUR_COREBLUETOOTH_UUID
 
-# 测试触发人工介入审批弹窗
-./.build/debug/CodexWatchCompanion --approval --card workbuddy --type "SCRIPT" --summary "执行自动化测试脚本"
+# 把手动 Workbuddy Credit 数据写入同一块手表
+./companion/.build/release/codex-watch-companion \
+  --remaining 83.3 --reset 0 --card workbuddy \
+  --credits 1250 --total-credits 1500 \
+  --device-id YOUR_COREBLUETOOTH_UUID
+
+# 发起带请求 ID 关联的 v2 审批
+./companion/.build/release/codex-watch-companion --approval \
+  --card workbuddy --type SCRIPT --summary "执行自动化测试脚本" \
+  --device-id YOUR_COREBLUETOOTH_UUID
 ```
 
 #### Python 同步脚本
@@ -136,9 +147,16 @@ pip install -r requirements.txt  # 或 pip install bleak pytest
 # 运行自动化单元测试
 pytest tests/
 
-# 自动同步 Codex 额度
-python scripts/sync_watch.py --auto
+# 通过默认原生后端同步真实 Codex 额度
+python scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
+
+# 显式使用 Python/Bleak 发送 v2 审批
+python scripts/sync_watch.py --backend bleak --approval \
+  --summary "执行自动化测试脚本" \
+  --device-id YOUR_COREBLUETOOTH_UUID
 ```
+
+只有演示发现模式允许不绑定设备，而且它始终写入合成数据；真实命令不会按显示名称选择设备。详细信息请参阅[伴侣工具指南](companion/README.md)、权威的[协议 v2 文档](docs/COMPANION_PROTOCOL.md)和 [v1.01 发布说明](docs/release-notes-v1.01.md)。
 
 ---
 

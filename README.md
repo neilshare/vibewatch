@@ -60,9 +60,9 @@ When an AI agent performs sensitive operations (reading files, executing scripts
 
 ---
 
-### 3. 6-Agent Subtask Ring & Push-to-Talk Voice Input
+### 3. 6-Agent Subtask Ring & Push-to-Talk Control
 - **6 Outer Ring Nodes**: Track up to 6 concurrent parallel agent sessions or subtasks with real-time breathing/pulsing status indicators.
-- **Center Push-to-Talk Mic**: Press and hold the center dial area (or the right physical button) to speak prompts directly to the active coding agent.
+- **Center Push-to-Talk Control**: Press and hold the center dial area (or the right physical button) to send a push-to-talk HID control event to the active coding agent. This firmware does not capture or stream microphone audio.
 
 ---
 
@@ -97,7 +97,7 @@ git clone https://github.com/neilshare/vibewatch.git
 cd vibewatch
 
 # 2. Build and upload firmware to the watch
-platformio run --target upload
+platformio run -e m5stack-stopwatch --target upload
 ```
 
 ---
@@ -106,7 +106,9 @@ platformio run --target upload
 
 1. Tap the **Settings** icon on the bottom-left of the watch screen.
 2. Select a device slot (e.g. Slot 1) and tap **PAIR**.
-3. Open Bluetooth settings on your computer and connect to `Vibe Watch #1`.
+3. Open Bluetooth settings on your Mac and connect to `Vibe Watch #1`.
+4. Keep the selected CoreBluetooth UUID private. Every real companion write
+   below must use that exact value as `YOUR_COREBLUETOOTH_UUID`.
 
 ---
 
@@ -116,16 +118,26 @@ platformio run --target upload
 A standalone Swift CLI utilizing macOS CoreBluetooth to ensure instant GATT synchronization even when connected as a HID keyboard:
 
 ```bash
-cd companion && swift build
+swift build --package-path companion -c release
 
-# Sync live rate limits to active card
-./.build/debug/CodexWatchCompanion --card codex
+# Synthetic demo discovery only: broadly finds a nearby watch, writes sample
+# quota data, and reports the selected CoreBluetooth UUID on stderr.
+./companion/.build/release/codex-watch-companion --demo --verbose
 
-# Sync Workbuddy credits balance
-./.build/debug/CodexWatchCompanion --card workbuddy --credits 1250 --total-credits 1500
+# Sync real Codex rate limits to one pinned watch
+./companion/.build/release/codex-watch-companion --auto --card codex \
+  --device-id YOUR_COREBLUETOOTH_UUID
 
-# Trigger a test approval dialog
-./.build/debug/CodexWatchCompanion --approval --card workbuddy --type "SCRIPT" --summary "Run automated test suite"
+# Sync a manual Workbuddy credit balance to the same pinned watch
+./companion/.build/release/codex-watch-companion \
+  --remaining 83.3 --reset 0 --card workbuddy \
+  --credits 1250 --total-credits 1500 \
+  --device-id YOUR_COREBLUETOOTH_UUID
+
+# Send a correlated protocol-v2 approval request
+./companion/.build/release/codex-watch-companion --approval \
+  --card workbuddy --type SCRIPT --summary "Run automated test suite" \
+  --device-id YOUR_COREBLUETOOTH_UUID
 ```
 
 #### Python CLI & Unit Tests
@@ -136,9 +148,20 @@ pip install pytest bleak
 # Run automated unit test suite
 pytest tests/
 
-# Automatically sync local Codex quota
-python scripts/sync_watch.py --auto
+# Automatically sync real local Codex quota through the native backend
+python scripts/sync_watch.py --auto --device-id YOUR_COREBLUETOOTH_UUID
+
+# Explicit Python/Bleak v2 approval transport
+python scripts/sync_watch.py --backend bleak --approval \
+  --summary "Run automated test suite" \
+  --device-id YOUR_COREBLUETOOTH_UUID
 ```
+
+Demo discovery is the only unpinned Bluetooth mode and always writes synthetic
+data. Real commands never select a peripheral by display name. See the
+[companion guide](companion/README.md), authoritative
+[protocol v2 reference](docs/COMPANION_PROTOCOL.md), and
+[v1.01 release notes](docs/release-notes-v1.01.md).
 
 ---
 

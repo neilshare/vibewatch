@@ -1,8 +1,9 @@
-# macOS quota companion
+# macOS VibeWatch companion
 
 The Swift companion reads the current Codex rate-limit window from a local
-Codex App Server and writes a small quota snapshot to one explicitly bound
-StopWatch over the project's private BLE service.
+Codex App Server, writes quota snapshots, and performs correlated approval
+transactions with one explicitly bound StopWatch over the project's private
+BLE service.
 
 It uses the user's existing local Codex/ChatGPT sign-in context. It does not
 scrape the UI, use a cloud relay, read credentials directly, require an OpenAI
@@ -12,7 +13,7 @@ API key, or put an account token on the watch.
 
 Requirements:
 
-- macOS 14 or newer;
+- macOS 13 or newer;
 - Swift 5.10 or newer (Xcode 15.3 Command Line Tools or newer);
 - a locally available Codex executable or an explicit `--codex-path`.
 
@@ -24,18 +25,20 @@ No prebuilt companion binary is distributed by this project.
 
 ## Bind a StopWatch safely
 
-First run demo discovery. It writes synthetic data only and prints the
-CoreBluetooth UUID assigned by this Mac:
+After pairing through the watch settings UI and macOS Bluetooth settings, run
+demo discovery. This is the only broad-discovery mode: it selects a nearby
+matching device and writes synthetic quota data. With `--verbose`, the selected
+CoreBluetooth UUID assigned by this Mac is reported on stderr:
 
 ```sh
 .build/release/codex-watch-companion --demo --verbose
 ```
 
-Use the exact UUID printed on this Mac for every real write:
+Keep that full UUID private and use it for every real write:
 
 ```sh
 .build/release/codex-watch-companion \
-  --device-id YOUR_COREBLUETOOTH_UUID --verbose
+  --auto --device-id YOUR_COREBLUETOOTH_UUID --verbose
 ```
 
 For continuous refreshes while the terminal remains open:
@@ -57,31 +60,66 @@ Useful diagnostics:
 # Verify App Server parsing without using Bluetooth.
 .build/release/codex-watch-companion --json-only
 
-# Verify BLE discovery and writes using a synthetic snapshot.
+# Broadly discover a nearby watch and write a synthetic snapshot.
 .build/release/codex-watch-companion --demo --verbose
 ```
 
-## Optional USB-mic bootloader request
+Demo output is never evidence of a real account quota. Non-demo operations
+retrieve or scan only for the exact `--device-id`; they do not authorize a
+peripheral by its display name.
 
-The USB-mic firmware can be asked to restart into the ESP32-S3 serial
-bootloader over the same encrypted private GATT characteristic:
+## Manual quota and credits
 
 ```sh
 .build/release/codex-watch-companion \
-  --device-id YOUR_COREBLUETOOTH_UUID --enter-bootloader
+  --remaining 50 --reset 3600 --card codex \
+  --device-id YOUR_COREBLUETOOTH_UUID
+
+.build/release/codex-watch-companion \
+  --remaining 83.3 --reset 0 --card workbuddy \
+  --credits 1250 --total-credits 1500 \
+  --device-id YOUR_COREBLUETOOTH_UUID
 ```
 
-This explicit maintenance mode cannot be combined with `--demo`, `--watch`, or
-`--json-only`. The USB-mic firmware requires an encrypted, with-response write
-from the same BLE peer that completed a valid Codex HID RPC in the current
-connection epoch. Its main loop checks VBUS, waits 400 ms, checks VBUS again,
-and only then restarts. The stable non-microphone firmware never acts on this
-command.
+Manual quota requires both `--remaining` (`0...100`) and nonnegative `--reset`
+seconds. Credit fields must be supplied together, with nonnegative credits and
+a positive total. The watch preserves its prior valid snapshot when a payload
+is invalid and marks valid data stale after 180 seconds without refresh.
 
-An ATT acknowledgement proves only that the encrypted command reached the
-device, so the companion exits successfully only after BLE disconnects. Before
-uploading, resolve the newly enumerated `/dev/cu.*` bootloader port and verify
-that it belongs to this StopWatch; never reuse or guess a stale port.
+## Transactional approvals
+
+Protocol v2 subscribes to the approval-result indication before sending a
+write-with-response request. The result is accepted only when its canonical
+request UUID matches exactly:
+
+```sh
+.build/release/codex-watch-companion --approval \
+  --request-id 550e8400-e29b-41d4-a716-446655440000 \
+  --card codex --agent-id 0 --type WRITE \
+  --summary 'Update the selected file' --ttl-ms 30000 \
+  --device-id YOUR_COREBLUETOOTH_UUID --verbose
+```
+
+If `--request-id` is omitted, the companion creates one. `--agent-id` is
+`0...5`; type and summary limits are 23 and 95 UTF-8 bytes; TTL is
+`5000...120000` milliseconds. Approve, reject, expired, and delivered cancelled
+outcomes print one sorted-key JSON object and exit `0`. Inspect `decision`—exit
+`0` does not itself mean approval. Protocol/transport failures exit `1`, and
+usage failures exit `2`. Machine output is on stdout; human progress is on
+stderr.
+
+For one v1.01 compatibility cycle only, an old integration may opt in with:
+
+```sh
+.build/release/codex-watch-companion --approval --legacy-approval \
+  --card codex --type EXEC --summary 'Legacy compatibility check' \
+  --device-id YOUR_COREBLUETOOTH_UUID
+```
+
+There is no automatic downgrade. Legacy mode ends after the encrypted `.03`
+ATT acknowledgement and produces only the legacy HID action after the watch
+decision; it does not also produce a v2 result. The adapter is scheduled for
+removal in the next release.
 
 ## Optional local background installation
 
@@ -113,14 +151,14 @@ Do not edit the tracked example in place. Never commit the generated plist,
 app, UUID, usernames, home paths, or logs. The root README contains the
 recommended prompt for asking Codex to perform and verify this installation.
 
-The first Bluetooth access may trigger a macOS permission prompt. Discovery
-filters on the private quota service UUID rather than the advertised
-`Codex Micro` name. Real writes additionally require the exact bound
-CoreBluetooth UUID, so another same-name peripheral is ignored.
+The first Bluetooth access may trigger a macOS permission prompt. Demo scans by
+the private service or supported device names. Real writes require the exact
+bound CoreBluetooth UUID, so another same-name peripheral is ignored.
 
 ## Data boundary
 
-The companion sends only the percentage and reset fields documented in
+The complete schemas, UUIDs, permissions, decision semantics, errors, and
+migration schedule are in
 [`docs/COMPANION_PROTOCOL.md`](../docs/COMPANION_PROTOCOL.md). Agent status,
-button events, voice actions, and analog directions stay on the Codex Micro HID
-channel. Audio is outside this companion's scope.
+button events, push-to-talk control, and analog directions stay on the BLE HID
+channel. This firmware and companion do not capture or stream audio.

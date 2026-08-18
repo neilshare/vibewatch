@@ -8,8 +8,9 @@ namespace vibe {
 constexpr char kDeviceNamePrefix[] = "Vibe Watch #";
 constexpr char kManufacturer[] = "VibeWatch";
 constexpr char kModelNumber[] = "VibeWatch";
-// Compatibility version used by the reference firmware.
-constexpr char kFirmwareVersion[] = "v1.0";
+// Release and companion-protocol versions reported by the reference firmware.
+constexpr char kFirmwareVersion[] = "v1.01";
+constexpr std::uint8_t kCompanionProtocolVersion = 2;
 
 constexpr std::uint16_t kVendorId = 0x303A;
 constexpr std::uint16_t kProductId = 0x8360;
