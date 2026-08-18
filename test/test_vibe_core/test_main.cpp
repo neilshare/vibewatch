@@ -1,4 +1,6 @@
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -454,6 +456,72 @@ void test_hid_reconnect_generation_rejects_prior_handle_chunks() {
                              completed.length);
 }
 
+static std::string firmwareSource() {
+    std::ifstream source("src/main.cpp");
+    return {std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+}
+
+static std::string sourceFunction(const std::string& source,
+                                  const char* signature,
+                                  const char* nextSignature) {
+    const auto begin = source.find(signature);
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto end = source.find(nextSignature, begin + std::strlen(signature));
+    if (end == std::string::npos) {
+        return source.substr(begin);
+    }
+    return source.substr(begin, end - begin);
+}
+
+void test_heap_diagnostic_format_is_stable_and_sanitized() {
+    const auto source = firmwareSource();
+    const auto diagnostic = sourceFunction(
+        source, "void emitFreeHeapDiagnostic(", "struct PendingIndication");
+
+    TEST_ASSERT_FALSE(diagnostic.empty());
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        diagnostic.find(
+            "VW_HEAP_DIAG sample=%lu event=%s free_bytes=%lu\\n"));
+    TEST_ASSERT_EQUAL(std::string::npos, diagnostic.find("request_id"));
+    TEST_ASSERT_EQUAL(std::string::npos, diagnostic.find("summary"));
+    TEST_ASSERT_EQUAL(std::string::npos, diagnostic.find("payload"));
+}
+
+void test_heap_diagnostics_cover_boot_and_v2_terminal_lifecycle() {
+    const auto source = firmwareSource();
+    const auto setupBody = sourceFunction(source, "void setup()", "void loop()");
+    const auto decideBody = sourceFunction(
+        source, "void decidePendingApproval(", "void expirePendingApproval(");
+    const auto expireBody = sourceFunction(
+        source, "void expirePendingApproval(", "void processApprovalIngress(");
+    const auto ingressBody = sourceFunction(
+        source, "void processIngressMessage(", "void processHidChunkInMainLoop(");
+
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        setupBody.find("emitFreeHeapDiagnostic(HeapDiagnosticEvent::Boot)"));
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        decideBody.find("emitFreeHeapDiagnostic(HeapDiagnosticEvent::Cancelled)"));
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        decideBody.find("emitFreeHeapDiagnostic(HeapDiagnosticEvent::Expired)"));
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        decideBody.find("emitFreeHeapDiagnostic(\n"
+                        "        choice == vibe::ApprovalChoice::Approve"));
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        expireBody.find("emitFreeHeapDiagnostic(HeapDiagnosticEvent::Expired)"));
+    TEST_ASSERT_NOT_EQUAL(
+        std::string::npos,
+        ingressBody.find("emitFreeHeapDiagnostic(HeapDiagnosticEvent::Cancelled)"));
+}
+
 void setup() {
     UNITY_BEGIN();
     RUN_TEST(test_accept_duplicate_busy_and_decide);
@@ -481,6 +549,8 @@ void setup() {
     RUN_TEST(test_indication_timeout_requires_active_disconnect);
     RUN_TEST(test_hid_overflow_rejects_suffix_until_new_connection_generation);
     RUN_TEST(test_hid_reconnect_generation_rejects_prior_handle_chunks);
+    RUN_TEST(test_heap_diagnostic_format_is_stable_and_sanitized);
+    RUN_TEST(test_heap_diagnostics_cover_boot_and_v2_terminal_lifecycle);
     UNITY_END();
 }
 

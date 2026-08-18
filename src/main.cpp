@@ -255,6 +255,35 @@ std::uint16_t g_pendingApprovalConnection = 0;
 std::uint32_t g_pendingApprovalGeneration = 0;
 bool g_v2ApprovalActive = false;
 
+enum class HeapDiagnosticEvent : std::uint8_t {
+    Boot,
+    Approved,
+    Rejected,
+    Expired,
+    Cancelled,
+};
+
+std::uint32_t g_heapDiagnosticSample = 0;
+
+const char* heapDiagnosticEventName(HeapDiagnosticEvent event) {
+    switch (event) {
+        case HeapDiagnosticEvent::Boot: return "boot";
+        case HeapDiagnosticEvent::Approved: return "approved";
+        case HeapDiagnosticEvent::Rejected: return "rejected";
+        case HeapDiagnosticEvent::Expired: return "expired";
+        case HeapDiagnosticEvent::Cancelled: return "cancelled";
+    }
+    return "unknown";
+}
+
+void emitFreeHeapDiagnostic(HeapDiagnosticEvent event) {
+    ++g_heapDiagnosticSample;
+    Serial.printf("VW_HEAP_DIAG sample=%lu event=%s free_bytes=%lu\n",
+                  static_cast<unsigned long>(g_heapDiagnosticSample),
+                  heapDiagnosticEventName(event),
+                  static_cast<unsigned long>(ESP.getFreeHeap()));
+}
+
 struct PendingIndication {
     bool active{false};
     std::uint16_t connectionHandle{0};
@@ -1054,6 +1083,7 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
         if (cancelled.hasValue) {
             Serial.printf("approval cancelled before input request_id=%.8s\n",
                           cancelled.value.requestId);
+            emitFreeHeapDiagnostic(HeapDiagnosticEvent::Cancelled);
         }
         g_v2ApprovalActive = false;
         g_approval.active = false;
@@ -1071,6 +1101,7 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
         g_pendingApprovalConnection = 0;
         g_pendingApprovalGeneration = 0;
         g_uiDirty = true;
+        emitFreeHeapDiagnostic(HeapDiagnosticEvent::Expired);
         return;
     }
     const auto decision = g_approvalController.decide(choice, nowMs);
@@ -1095,6 +1126,10 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
         vibrate(120, 35);
     }
     g_uiDirty = true;
+    emitFreeHeapDiagnostic(
+        choice == vibe::ApprovalChoice::Approve
+            ? HeapDiagnosticEvent::Approved
+            : HeapDiagnosticEvent::Rejected);
 }
 
 void expirePendingApproval(std::uint32_t nowMs) {
@@ -1117,6 +1152,7 @@ void expirePendingApproval(std::uint32_t nowMs) {
     g_pendingApprovalConnection = 0;
     g_pendingApprovalGeneration = 0;
     g_uiDirty = true;
+    emitFreeHeapDiagnostic(HeapDiagnosticEvent::Expired);
 }
 
 void processApprovalIngress(const vibe::IngressMessage& ingress,
@@ -1207,6 +1243,9 @@ void processIngressMessage(const vibe::IngressMessage& ingress,
                                        ingress.connectionGeneration, nowMs)) {
                 Serial.printf("approval cancelled transport_error request_id=%.8s\n",
                               cancelled.value.requestId);
+            }
+            if (cancelled.hasValue) {
+                emitFreeHeapDiagnostic(HeapDiagnosticEvent::Cancelled);
             }
         }
         NimBLEDevice::startAdvertising();
@@ -3222,6 +3261,7 @@ void setup() {
     renderUi(millis());
     initializeBle();
     g_uiDirty = true;
+    emitFreeHeapDiagnostic(HeapDiagnosticEvent::Boot);
 }
 
 void loop() {
