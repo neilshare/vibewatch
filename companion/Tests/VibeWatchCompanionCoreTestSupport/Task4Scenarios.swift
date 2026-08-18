@@ -5,6 +5,7 @@ public enum Task4ScenarioGroup: Sendable {
     case models
     case options
     case appServerAndRunner
+    case approvalTransportAndRunner
 }
 
 public struct Task4ScenarioFailure: Error, CustomStringConvertible {
@@ -24,12 +25,15 @@ public enum Task4Scenarios {
         case .appServerAndRunner:
             try runAppServerAndRunnerScenarios()
             return 7
+        case .approvalTransportAndRunner:
+            try runApprovalTransportAndRunnerScenarios()
+            return 8
         }
     }
 
     @discardableResult
     public static func runAll() throws -> Int {
-        try run(.models) + run(.options) + run(.appServerAndRunner)
+        try run(.models) + run(.options) + run(.appServerAndRunner) + run(.approvalTransportAndRunner)
     }
 
     private static func runModelScenarios() throws {
@@ -187,7 +191,7 @@ public enum Task4Scenarios {
         var waits = 0
         let runner = Runner(
             appServerFactory: { _ in appServer },
-            writer: writer,
+            transport: writer,
             wait: { _ in waits += 1 },
             shouldContinueWatching: { completedIterations in completedIterations < 2 }
         )
@@ -200,6 +204,69 @@ public enum Task4Scenarios {
         try check(emittedBeforeCompletion == [true, true], "watch output was buffered until completion")
         try check(result.stdout.isEmpty, "watch output accumulated in CommandResult storage")
         try check(writer.quotaWrites == 2 && waits == 1, "finite watch loop did not perform two writes and one wait")
+    }
+
+    private static func runApprovalTransportAndRunnerScenarios() throws {
+        let requestID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440000")!
+        let otherID = UUID(uuidString: "7d444840-9dc0-11d1-b245-5ffdce74fad2")!
+        let deviceID = UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!
+        let request = ApprovalRequestV2(
+            requestID: requestID, card: .codex, agentID: 0,
+            operationType: "EXEC", summary: "Run tests", ttlMs: 5_000
+        )
+        let options = try CompanionOptions.parse([
+            "tool", "--approval", "--request-id", requestID.uuidString.lowercased(),
+            "--summary", "Run tests", "--ttl-ms", "5000", "--device-id", deviceID.uuidString,
+        ])
+
+        for decision in ApprovalDecision.allCases {
+            let response = ApprovalDecisionV2(
+                requestID: requestID, decision: decision, decidedAtMs: 184_230
+            )
+            let transport = FakeTransport(approvalResult: .success(response))
+            let result = try Runner(transport: transport).run(options: options) { _ in }
+            try check(result.exitCode == 0, "\(decision.rawValue) was not a delivered success")
+            try check(
+                result.stdout == expectedDecisionJSON(decision, requestID: requestID),
+                "\(decision.rawValue) result was not exact sorted-key JSON"
+            )
+            try check(transport.requestedApprovals == [request], "runner changed the approval request")
+            try check(transport.deviceIDs == [deviceID], "runner did not preserve the pinned device")
+        }
+
+        let mismatch = ApprovalDecisionV2(requestID: otherID, decision: .approve, decidedAtMs: 1)
+        let matcher = ApprovalResultMatcher(requestID: requestID)
+        let encoder = JSONEncoder()
+        try check(matcher.receive(try encoder.encode(mismatch)) == nil, "mismatched indication was delivered")
+        let matching = ApprovalDecisionV2(requestID: requestID, decision: .approve, decidedAtMs: 2)
+        let matchingData = try encoder.encode(matching)
+        try check(matcher.receive(matchingData) == matching, "matching indication was not delivered")
+        try check(matcher.receive(matchingData) == nil, "duplicate indication was delivered twice")
+
+        let timeout = FakeTransport(approvalResult: .failure(BLETransportError.timeout))
+        let timeoutResult = try Runner(transport: timeout).run(options: options) { _ in }
+        try check(timeoutResult.exitCode == 1, "transport timeout did not fail")
+        try check(
+            timeoutResult.stdout == #"{"code":"transport_error","kind":"error","message":"Timed out waiting for a matching approval decision.","version":2}"#,
+            "transport timeout error JSON is unstable"
+        )
+
+        let missing = FakeTransport(approvalResult: .failure(BLETransportError.deviceNotFound))
+        let missingResult = try Runner(transport: missing).run(options: options) { _ in }
+        try check(missingResult.exitCode == 1, "missing pinned device did not fail")
+        try check(
+            missingResult.stdout == #"{"code":"device_not_found","kind":"error","message":"Pinned Bluetooth device was not found.","version":2}"#,
+            "missing-device error JSON is unstable"
+        )
+
+        let wrongResponse = FakeTransport(approvalResult: .success(mismatch))
+        let wrongResult = try Runner(transport: wrongResponse).run(options: options) { _ in }
+        try check(wrongResult.exitCode == 1, "runner accepted a mismatched transport response")
+        try check(wrongResult.stdout.contains(#""code":"transport_error""#), "mismatch lacked transport_error code")
+    }
+
+    private static func expectedDecisionJSON(_ decision: ApprovalDecision, requestID: UUID) -> String {
+        #"{"decided_at_ms":184230,"decision":"\#(decision.rawValue)","kind":"approval_decision","request_id":"\#(requestID.uuidString.lowercased())","version":2}"#
     }
 
     private static func check(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -262,13 +329,32 @@ private final class SequenceAppServer: AppServerServing {
     }
 }
 
-private final class RecordingWriter: BLEWriting {
+private final class RecordingWriter: BLETransporting {
     var quotaWrites = 0
 
-    func writeQuota(_ payload: Data, deviceID: UUID?, verbose: Bool) throws {
+    func writeQuota(_ snapshot: QuotaSnapshot, deviceID: UUID) throws {
         quotaWrites += 1
     }
 
-    func writeApproval(_ payload: Data, deviceID: UUID, verbose: Bool) throws {}
-    func enterBootloader(deviceID: UUID, verbose: Bool) throws {}
+    func requestApproval(_ request: ApprovalRequestV2, deviceID: UUID) throws -> ApprovalDecisionV2 {
+        throw BLETransportError.transport("unexpected approval")
+    }
+}
+
+private final class FakeTransport: BLETransporting {
+    let approvalResult: Result<ApprovalDecisionV2, Error>
+    var requestedApprovals: [ApprovalRequestV2] = []
+    var deviceIDs: [UUID] = []
+
+    init(approvalResult: Result<ApprovalDecisionV2, Error>) {
+        self.approvalResult = approvalResult
+    }
+
+    func writeQuota(_ snapshot: QuotaSnapshot, deviceID: UUID) throws {}
+
+    func requestApproval(_ request: ApprovalRequestV2, deviceID: UUID) throws -> ApprovalDecisionV2 {
+        requestedApprovals.append(request)
+        deviceIDs.append(deviceID)
+        return try approvalResult.get()
+    }
 }

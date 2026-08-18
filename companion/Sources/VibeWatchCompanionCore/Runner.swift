@@ -1,11 +1,5 @@
 import Foundation
 
-public protocol BLEWriting: AnyObject {
-    func writeQuota(_ payload: Data, deviceID: UUID?, verbose: Bool) throws
-    func writeApproval(_ payload: Data, deviceID: UUID, verbose: Bool) throws
-    func enterBootloader(deviceID: UUID, verbose: Bool) throws
-}
-
 public struct CommandResult: Equatable, Sendable {
     public let stdout: String
     public let exitCode: Int
@@ -16,141 +10,156 @@ public struct CommandResult: Equatable, Sendable {
     }
 }
 
+public struct ErrorOutputV2: Codable, Equatable, Sendable {
+    public let version: Int
+    public let kind: String
+    public let code: String
+    public let message: String
+
+    public init(code: String, message: String) {
+        self.version = 2
+        self.kind = "error"
+        self.code = code
+        self.message = message
+    }
+}
+
+public enum MachineOutput {
+    public static func errorResult(for error: Error, exitCode: Int = 1) -> CommandResult {
+        let code: String
+        if let transport = error as? BLETransportError {
+            code = transport.code
+        } else if case .usage = error as? CompanionError {
+            code = "usage_error"
+        } else {
+            code = "transport_error"
+        }
+        let response = ErrorOutputV2(code: code, message: error.localizedDescription)
+        return CommandResult(stdout: encode(response), exitCode: exitCode)
+    }
+
+    public static func encode<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(value) else {
+            return #"{"code":"transport_error","kind":"error","message":"Could not encode command result.","version":2}"#
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 public protocol CommandRunner {
     func run(options: CompanionOptions, emit: (String) -> Void) throws -> CommandResult
 }
 
 public final class Runner: CommandRunner {
     private let appServerFactory: (String) throws -> AppServerServing
-    private let writer: any BLEWriting
+    private let transport: any BLETransporting
     private let wait: (TimeInterval) -> Void
     private let shouldContinueWatching: (Int) -> Bool
 
     public init(
         appServerFactory: @escaping (String) throws -> AppServerServing = { try AppServerClient(codexPath: $0) },
-        writer: any BLEWriting,
+        transport: any BLETransporting,
         wait: @escaping (TimeInterval) -> Void = { interval in
             RunLoop.current.run(until: Date().addingTimeInterval(interval))
         },
         shouldContinueWatching: @escaping (Int) -> Bool = { _ in true }
     ) {
         self.appServerFactory = appServerFactory
-        self.writer = writer
+        self.transport = transport
         self.wait = wait
         self.shouldContinueWatching = shouldContinueWatching
     }
 
     public func run(options: CompanionOptions, emit: (String) -> Void) throws -> CommandResult {
+        do {
+            return try runCommand(options: options, emit: emit)
+        } catch {
+            return MachineOutput.errorResult(for: error)
+        }
+    }
+
+    private func runCommand(options: CompanionOptions, emit: (String) -> Void) throws -> CommandResult {
         if options.helpRequested {
             emit(CompanionOptions.help)
             return CommandResult()
         }
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-
         switch options.mode {
         case .approval(let request):
-            struct LegacyApproval: Encodable {
-                let method = "v.oai.approval_req"
-                struct Params: Encodable {
-                    let active = true
-                    let type: String
-                    let summary: String
-                    let card: String
-                }
-                let params: Params
-            }
-            let payload = try encoder.encode(LegacyApproval(params: .init(
-                type: request.operationType,
-                summary: request.summary,
-                card: request.card.rawValue
-            )))
             guard let deviceID = options.deviceIdentifier else {
                 throw CompanionError.usage("--approval requires --device-id")
             }
-            try writer.writeApproval(payload, deviceID: deviceID, verbose: options.verbose)
-            emit("✓ 已向 StopWatch 发送人工确认请求：[\(request.operationType)] \(request.summary) (Card: \(request.card.rawValue))")
+            if options.legacyApproval {
+                try transport.writeLegacyApproval(request, deviceID: deviceID)
+                return CommandResult()
+            }
+            let decision = try transport.requestApproval(request, deviceID: deviceID)
+            guard decision.requestID == request.requestID,
+                  decision.version == 2,
+                  decision.kind == "approval_decision" else {
+                throw BLETransportError.transport("Transport returned an uncorrelated approval decision.")
+            }
+            return CommandResult(stdout: MachineOutput.encode(decision))
 
         case .enterBootloader:
             guard let deviceID = options.deviceIdentifier else {
                 throw CompanionError.usage("--enter-bootloader requires --device-id")
             }
-            try writer.enterBootloader(deviceID: deviceID, verbose: options.verbose)
-            emit("bootloader 命令已获 ATT ACK，随后 BLE 断开；仅在新 USB 串口出现后继续刷写")
+            try transport.enterBootloader(deviceID: deviceID)
+            return CommandResult()
 
         case .manualQuota(let snapshot):
-            emit(try writeQuota(snapshot, options: options, encoder: encoder))
+            guard let deviceID = options.deviceIdentifier else {
+                throw CompanionError.usage("manual quota requires --device-id")
+            }
+            try transport.writeQuota(snapshot, deviceID: deviceID)
+            return CommandResult(stdout: MachineOutput.encode(snapshot))
 
         case .demo(let snapshot):
-            try runQuotaLoop(initial: snapshot, client: nil, options: options, encoder: encoder, emit: emit)
+            let devices = try transport.discoverDemoDevices()
+            guard let deviceID = devices.first else { throw BLETransportError.deviceNotFound }
+            try transport.writeQuota(snapshot, deviceID: deviceID)
+            return CommandResult(stdout: MachineOutput.encode(snapshot))
 
         case .automaticQuota:
             let client = try appServerFactory(options.codexPath)
-            try runQuotaLoop(initial: nil, client: client, options: options, encoder: encoder, emit: emit)
+            return try runQuotaLoop(client: client, options: options, emit: emit)
 
         case .jsonOnly:
             var snapshot = try appServerFactory(options.codexPath).readRateLimits()
             applyOverrides(to: &snapshot, options: options)
-            emit(try encode(snapshot, with: encoder))
+            return CommandResult(stdout: MachineOutput.encode(snapshot))
         }
-        return CommandResult()
     }
 
     private func runQuotaLoop(
-        initial: QuotaSnapshot?,
-        client: AppServerServing?,
+        client: AppServerServing,
         options: CompanionOptions,
-        encoder: JSONEncoder,
         emit: (String) -> Void
-    ) throws {
+    ) throws -> CommandResult {
+        guard let deviceID = options.deviceIdentifier else {
+            throw CompanionError.usage("automatic quota requires --device-id")
+        }
         var completedIterations = 0
+        var lastJSON = ""
         repeat {
-            var snapshot: QuotaSnapshot
-            if let initial {
-                snapshot = initial
-            } else if let client {
-                snapshot = try client.readRateLimits()
-                applyOverrides(to: &snapshot, options: options)
-            } else {
-                throw CompanionError.malformedRateLimits("没有可用的额度来源")
-            }
-
-            emit(try writeQuota(snapshot, options: options, encoder: encoder))
+            var snapshot = try client.readRateLimits()
+            applyOverrides(to: &snapshot, options: options)
+            try transport.writeQuota(snapshot, deviceID: deviceID)
+            lastJSON = MachineOutput.encode(snapshot)
             completedIterations += 1
+            if options.watch { emit(lastJSON) }
             guard options.watch, shouldContinueWatching(completedIterations) else { break }
             wait(options.interval)
         } while true
-    }
-
-    private func writeQuota(
-        _ snapshot: QuotaSnapshot,
-        options: CompanionOptions,
-        encoder: JSONEncoder
-    ) throws -> String {
-        let payload = try encoder.encode(snapshot)
-        let json = try encode(snapshot, with: encoder)
-        try writer.writeQuota(payload, deviceID: options.deviceIdentifier, verbose: options.verbose)
-        return "\(json)\n✓ 已写入 StopWatch：剩余 \(Int(snapshot.remainingPercent.rounded()))%，\(formatReset(seconds: snapshot.resetInSeconds)) 后重置"
-    }
-
-    private func encode(_ snapshot: QuotaSnapshot, with encoder: JSONEncoder) throws -> String {
-        let data = try encoder.encode(snapshot)
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw CompanionError.malformedRateLimits("无法编码额度 JSON")
-        }
-        return json
+        return CommandResult(stdout: options.watch ? "" : lastJSON)
     }
 
     private func applyOverrides(to snapshot: inout QuotaSnapshot, options: CompanionOptions) {
         snapshot.card = options.card
         if let credits = options.credits { snapshot.credits = credits }
         if let totalCredits = options.totalCredits { snapshot.totalCredits = totalCredits }
-    }
-
-    private func formatReset(seconds: Int) -> String {
-        if seconds >= 86_400 { return "\(seconds / 86_400)d \((seconds % 86_400) / 3_600)h" }
-        if seconds >= 3_600 { return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m" }
-        return "\(max(0, seconds) / 60)m"
     }
 }

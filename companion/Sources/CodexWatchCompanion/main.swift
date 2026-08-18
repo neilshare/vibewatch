@@ -10,14 +10,18 @@ NSApplication.shared.setActivationPolicy(.prohibited)
 
 do {
     let options = try CompanionOptions.parse(CommandLine.arguments)
-    let result = try Runner(writer: LegacyBLEWriter()).run(options: options) { output in
+    let transport = BLETransport(verbose: options.verbose) { progress in
+        fputs("\(progress)\n", stderr)
+    }
+    let result = try Runner(transport: transport).run(options: options) { output in
         print(output)
     }
+    if !result.stdout.isEmpty { print(result.stdout) }
     exit(Int32(result.exitCode))
 } catch {
-    fputs("错误：\(error.localizedDescription)\n", stderr)
-    if case .usage = error as? CompanionError {
-        exit(2)
-    }
-    exit(1)
+    let isUsage: Bool
+    if case .usage = error as? CompanionError { isUsage = true } else { isUsage = false }
+    let result = MachineOutput.errorResult(for: error, exitCode: isUsage ? 2 : 1)
+    print(result.stdout)
+    exit(Int32(result.exitCode))
 }
