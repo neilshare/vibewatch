@@ -15,18 +15,18 @@ worktree.
 
 | Field | Recorded value |
 | --- | --- |
-| Firmware source commit | `<git rev-parse HEAD>` |
-| Companion source commit | `<git rev-parse HEAD>` |
+| Firmware source commit | `a848d0936d77648972e3cb9340d39a84e7d7a896` |
+| Companion source commit | `a848d0936d77648972e3cb9340d39a84e7d7a896` |
 | Firmware version / protocol | `v1.01 / 2` |
-| macOS version/build | `<sw_vers output>` |
-| Swift version | `<swift --version>` |
-| PlatformIO version | `<./.venv/bin/platformio --version>` |
-| Firmware SHA-256 | `<sha256>` |
-| Companion SHA-256 | `<sha256>` |
-| Device identifier suffix | `<last 6 characters only>` |
-| Test start, local time + zone | `<YYYY-MM-DD HH:MM TZ>` |
-| Test end, local time + zone | `<YYYY-MM-DD HH:MM TZ>` |
-| Operator | `<initials>` |
+| macOS version/build | `macOS 26.5.2 (25F84)` |
+| Swift version | `Apple Swift 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)` |
+| PlatformIO version | `Core 6.1.19` |
+| Firmware SHA-256 | `7a6604c5b52174dbb1e2fcb929ceacacfbce89539adb554d4d95f199d008e278` |
+| Companion SHA-256 | `e3de8af3b5515e1e7b5f58669f9fe44282fb859b28a5f6c6e0c59cc9a683152a` |
+| Device identifier suffix | `966a93` |
+| Test start, local time + zone | `2026-08-18 10:23 CST` |
+| Test end, local time + zone | `2026-08-18 11:17 CST` |
+| Operator | `Codex automation + device owner visual/physical confirmation` |
 
 Keep the full CoreBluetooth identifier only in the current shell:
 
@@ -231,9 +231,9 @@ according to local policy; do not commit it.
 
 ### 1. Fresh boot starts unsynchronized
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<all three cards show waiting/not-synced; no sample 86/85/78 or credits>`
-- Sanitized excerpt/photo reference: `<reference>`
+- Result: `PASS`
+- Evidence: `After the release image was uploaded to the explicitly selected USB port and the device was reset without a host sync, the operator visually confirmed that all three cards showed waiting/not-synced and that no 86/85/78 sample quota or sample credits appeared.`
+- Sanitized excerpt/photo reference: `Operator visual confirmation at 2026-08-18 10:28 CST; no photo retained.`
 
 ### 2. Unpaired writes cannot mutate state
 
@@ -243,84 +243,84 @@ write before pairing again. Cancel any new macOS pairing prompt during these
 negative attempts; accepting it would create a new encrypted/bonded session
 rather than test an unpaired write.
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<ATT security failure; no quota change, modal, sound, or vibration>`
-- Sanitized excerpt: `<reference>`
+- Result: `PASS`
+- Evidence: `After forgetting the device, two clean pinned negative attempts were run separately while the operator cancelled every pairing prompt and did not touch the watch. Both the .02 quota write and the .03 approval write exited 1 with ATT security rejection; the operator confirmed no target quota/card mutation, approval modal, sound, or vibration. A prior attempt in which pairing was accepted was discarded as invalid evidence.`
+- Sanitized excerpt: `Both clean attempts: ATT write failed with CBATTErrorDomain code 15. The Workbuddy sentinel values 17% and 123/999 never appeared. A pre-existing Codex synthetic demo value was explicitly excluded from this negative target check.`
 
 ### 3. Pairing and pinned-device selection succeed
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<normal UI pairing; selected UUID suffix matches later real writes>`
-- Device suffix only: `<6 chars>`
+- Result: `PASS`
+- Evidence: `The operator paired Vibe Watch #1 through the normal macOS Bluetooth UI. Subsequent real quota and manual-credit writes used the same pinned CoreBluetooth identifier discovered in demo mode and completed with ATT responses.`
+- Device suffix only: `966a93`
 
 ### 4. Real quota and credits route to the requested card
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<Codex quota and Workbuddy credits appear only on requested cards; stale state after >180 s>`
+- Result: `PASS`
+- Evidence: `Pinned App Server writes populated only the Codex card (6% in the first run; 2% after the later reboot) and pinned manual writes populated only Workbuddy with 50% and 500/1000 credits. Antigravity remained waiting/not-synced and no value crossed cards. After all writers stopped for more than 180 seconds, the operator confirmed Codex and Workbuddy were visibly marked stale while retaining their last values, and Antigravity remained waiting.`
 
 ### 5. Approve and reject correlate exactly once
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<touch approve ID/decision; button reject ID/decision; one stdout object each>`
+- Result: `PASS`
+- Evidence: `Touch approval produced exactly one stdout decision for request suffix 440000 with decision approve and exit 0. Left-button rejection produced exactly one stdout decision for request suffix 74fad2 with decision reject and exit 0. No duplicate or stale object followed either result.`
 
 ### 6. Duplicate IDs do not replay alerts
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<one modal/alert for duplicate ID; original result only>`
+- Result: `PASS`
+- Evidence: `Two clients sent the same pending request suffix eeeeee. The operator observed one original modal and no second alert. The duplicate client was interrupted with no decision output; only the original client later received one matching reject decision.`
 
 ### 7. A concurrent different request receives `busy`
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<second ID and exact busy JSON; original modal unchanged>`
+- Result: `PASS`
+- Evidence: `While the original request was pending, a different request suffix ffffff exited 1 with code busy and message another request is pending. The operator confirmed the original modal was not replaced.`
 
 ### 8. Expired requests close without approval
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<matching expired JSON; modal closed; no approval HID action>`
+- Result: `PASS`
+- Evidence: `A 5000 ms request ending 000000 produced exactly one matching expired decision after about five seconds and exited 0. The operator confirmed the modal closed automatically with no approval action, sound, or vibration.`
 
 ### 9. Disconnect cancels without stale replay
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<modal closed; host transport failure; no result/modal for old ID after reconnect>`
+- Result: `PASS`
+- Evidence: `Bluetooth was disabled while request suffix 111111 was pending. The host exited 1 with transport_error and message Peripheral disconnected before completion. After Bluetooth was restored, the operator confirmed the old modal was absent, no stale decision appeared, and normal cards returned.`
 
 ### 10. Existing watch interactions still work
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<sleep/wake, touch and physical decisions, card gestures, PTT control event, sound, vibration, battery display>`
+- Result: `PASS`
+- Evidence: `The operator confirmed screen sleep and touch wake, touch approval, physical-button rejection, horizontal card gestures, user-observed center PTT feedback after a one-second hold/release, sound, vibration, and visible battery status. The contemporaneous serial slice did not contain ACT10/ACT11, so no serial PTT claim is made. Workbuddy and Antigravity each showed local selection animation, sound, and vibration; no matching external host consumers were running for those two card names.`
 
 The PTT check covers the HID control event only; this firmware does not stream
 microphone audio.
 
 ### 11. Legacy behavior is explicit and isolated
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<v2 emits no ACT07/ACT08; legacy requires flag and emits only legacy action>`
+- Result: `PASS`
+- Evidence: `A normal v2 request ended with one correlated expired decision; serial showed approval accepted and a v2 expired heap diagnostic, with no ACT07/ACT08. A request explicitly using --legacy-approval exited 0 immediately after the .03 ATT acknowledgement; the later operator decision emitted only ACT08 DOWN/UP on serial, with no v2 decision or v2 terminal heap event. The compatibility path is documented as deprecated for removal after v1.01.`
 
 ### 12. Disconnect/reconnect and 100-cycle soak remain stable
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Start free heap: `<bytes and sanitized serial timestamp>`
-- End free heap: `<bytes and sanitized serial timestamp>`
-- Outcome counts: `<48 approve / 48 reject / 4 expected disconnect transport_error / 0 unexpected failure>`
-- Evidence: `<no queue leak, material heap degradation, crash, or stuck modal>`
+- Result: `BLOCKED — NOT RUN at the user's explicit request`
+- Start free heap: `242476 bytes at boot sample 1, captured 2026-08-18 10:58 CST`
+- End free heap: `Not captured; the required 100-cycle soak was not started`
+- Outcome counts: `Not applicable; no 100-cycle denominator or 48/48/4 result is claimed`
+- Evidence: `Single-request lifecycle diagnostics were present and sanitized, including sample 2 expired at 242316 bytes. This does not substitute for soak evidence. Stability, queue growth, and monotonic heap retention across 100 attempts remain unverified.`
 
 ### 13. Agent labels are 2× and controls are unaffected
 
 Inspect all six circles on each of the three cards in default, selected,
 pressed, and animated states.
 
-- Result: `<PASS|FAIL|BLOCKED>`
-- Evidence: `<labels 1–6 about twice former character height, centered, fully inside circles, adequate contrast>`
-- Action-layer evidence: `<FAST/OK/NG/PLAN/AI typography and touch targets unchanged>`
-- Photo/video references: `<references>`
+- Result: `PASS`
+- Evidence: `The operator inspected labels 1–6 on Codex, Workbuddy, and Antigravity in default, selected, pressed, and animated states and confirmed they are approximately twice the former character height, centered, fully inside their circles, and clearly contrasted.`
+- Action-layer evidence: `The operator confirmed FAST/OK/NG/PLAN/AI typography and touch targets were unchanged. Circle 1 on all three cards produced local selection animation, sound, and vibration. Workbuddy and Antigravity had no external host-side effect because no corresponding host consumers were running; their watch-side controls remained functional and emitted through the same shared firmware path.`
+- Photo/video references: `Operator visual and interaction confirmation; no media retained.`
 
 ## Final result
 
 | Gate | Result |
 | --- | --- |
-| All 13 hardware cases complete and passing | `<PASS|FAIL|BLOCKED>` |
-| Automated gate rerun after hardware testing | `<PASS|FAIL|BLOCKED>` |
-| `git status --short` contains only this evidence edit | `<PASS|FAIL|BLOCKED>` |
-| Full UUIDs and raw logs absent from tracked files | `<PASS|FAIL|BLOCKED>` |
+| All 13 hardware cases complete and passing | `BLOCKED — case 12 soak not run by user request` |
+| Automated gate rerun after hardware testing | `BLOCKED — Python 42/42, firmware core 27/27, shared companion 37 groups, release builds and hygiene passed; local swift test cannot run because this Command Line Tools host has no XCTest runtime` |
+| `git status --short` contains only this evidence edit | `PASS before evidence commit` |
+| Full UUIDs and raw logs absent from tracked files | `PASS` |
 
-Release decision and notes: `<decision, approver, timestamp>`
+Release decision and notes: `BLOCKED for release: the user explicitly skipped the required 100-cycle soak, local XCTest requires full Xcode or macOS CI, and GitHub Actions status must be confirmed. Evidence recorded by Codex automation with device-owner confirmation on 2026-08-18 CST.`
