@@ -169,10 +169,22 @@ std::uint32_t g_callbackDeliveryId{0};
 
 vibe::HidRpcAssembler g_hidRpcAssembler;
 
+inline QuotaSnapshot makeDefaultQuota(float remaining, std::uint32_t resetSec, float credits = 0.0f, float total = 0.0f) {
+    QuotaSnapshot q{};
+    q.remainingPercent = remaining;
+    q.resetInSeconds = resetSec;
+    q.credits = credits;
+    q.totalCredits = total;
+    q.hasCredits = (credits > 0.0f || total > 0.0f);
+    q.available = true;
+    q.receivedAtMs = 0;
+    return q;
+}
+
 std::array<CardState, CARD_COUNT> g_cards = {{
-    CardState("CODEX", 0x12D6B2, QuotaSnapshot{}),
-    CardState("WORKBUDDY", 0x00E5FF, QuotaSnapshot{}),
-    CardState("ANTIGRAVITY", 0x9D74FF, QuotaSnapshot{})
+    CardState("CODEX", 0x12D6B2, makeDefaultQuota(86.0f, 230400)),
+    CardState("WORKBUDDY", 0x00E5FF, makeDefaultQuota(83.3f, 0, 1250.0f, 1500.0f)),
+    CardState("ANTIGRAVITY", 0x9D74FF, makeDefaultQuota(100.0f, 259200))
 }};
 
 AgentCard g_currentCard = CARD_CODEX;
@@ -663,13 +675,10 @@ void sendAgentEvent(int index, bool pressed) {
     std::snprintf(key, sizeof(key), "AG%02d", index);
     sendKeyEvent(key, pressed);
 
-    // Standard BLE HID Key: Send standard digit keys '1'..'6' (0x1E..0x23) and F13..F18
+    // Standard BLE HID Key: Send safe function keys F13..F18 (0x68..0x6D)
+    // NEVER emits ASCII digits '1'..'6' into user chat dialogs!
     if (index >= 0 && index < 6) {
-        if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
-            sendStandardKeyboardKey(0x00, 0x1E + index, pressed); // Direct standard digits '1'..'6'
-        } else {
-            sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
-        }
+        sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
     }
 }
 
