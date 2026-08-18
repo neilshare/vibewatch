@@ -21,7 +21,7 @@ public enum Task4Scenarios {
             return 3
         case .options:
             try runOptionScenarios()
-            return 9
+            return 11
         case .appServerAndRunner:
             try runAppServerAndRunnerScenarios()
             return 7
@@ -136,6 +136,15 @@ public enum Task4Scenarios {
         try expectUsage(["tool", "--enter-bootloader"], "--enter-bootloader requires --device-id")
         _ = try CompanionOptions.parse(["tool", "--demo"])
         _ = try CompanionOptions.parse(["tool", "--json-only"])
+
+        try check(
+            CompanionOptions.help.contains("--legacy-approval"),
+            "help omitted the accepted --legacy-approval option"
+        )
+        try check(
+            !CompanionOptions.help.contains("--enter-bootloader"),
+            "help advertised the hidden unsupported --enter-bootloader path"
+        )
     }
 
     private static func runAppServerAndRunnerScenarios() throws {
@@ -225,8 +234,12 @@ public enum Task4Scenarios {
         try check(demoEmitted.count == 2 && demoWaits == 1, "demo watch did not stream two writes with one wait")
         try check(demoResult.stdout.isEmpty, "demo watch accumulated final stdout")
         try check(
-            demoProgress.count == 1 && demoProgress[0].lowercased().contains("demo"),
-            "demo discovery was not clearly labeled through the non-verbose progress sink"
+            demoProgress.count == 1
+                && demoProgress[0].lowercased().contains("demo")
+                && demoProgress[0].lowercased().contains("synthetic")
+                && demoProgress[0].contains(demoDeviceID.uuidString.lowercased())
+                && demoProgress[0].contains("--device-id"),
+            "demo progress did not label synthetic discovery and expose bindable device UUID"
         )
     }
 

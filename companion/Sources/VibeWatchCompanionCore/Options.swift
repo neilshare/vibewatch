@@ -201,6 +201,7 @@ public struct CompanionOptions: Equatable, Sendable {
           --type T           Approval operation type (1...23 UTF-8 bytes)
           --summary S        Approval summary (1...95 UTF-8 bytes)
           --ttl-ms N         Approval TTL, 5000...120000 (default 30000)
+          --legacy-approval  Use the one-release legacy approval payload
           --device-id UUID   Pinned CoreBluetooth device for every real write
           --demo             Write a synthetic quota snapshot using demo discovery
           --json-only        Print App Server quota JSON without Bluetooth

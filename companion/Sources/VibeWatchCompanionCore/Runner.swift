@@ -121,9 +121,12 @@ public final class Runner: CommandRunner {
             return CommandResult(stdout: MachineOutput.encode(snapshot))
 
         case .demo(let snapshot):
-            progress("Demo discovery mode: writing synthetic quota snapshots.")
             let devices = try transport.discoverDemoDevices()
             guard let deviceID = devices.first else { throw BLETransportError.deviceNotFound }
+            progress(
+                "Demo discovery mode: selected synthetic device \(deviceID.uuidString.lowercased()); "
+                    + "bind future real writes with --device-id \(deviceID.uuidString.lowercased())."
+            )
             return try runDemoQuotaLoop(
                 snapshot: snapshot,
                 deviceID: deviceID,
