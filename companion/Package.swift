@@ -10,6 +10,19 @@ let package = Package(
         .executable(name: "codex-watch-companion", targets: ["CodexWatchCompanion"]),
     ],
     targets: [
-        .executableTarget(name: "CodexWatchCompanion"),
+        .target(name: "VibeWatchCompanionCore"),
+        .executableTarget(
+            name: "CodexWatchCompanion",
+            dependencies: ["VibeWatchCompanionCore"]
+        ),
+        .testTarget(
+            name: "VibeWatchCompanionCoreTests",
+            dependencies: ["VibeWatchCompanionCore"]
+        ),
+        .executableTarget(
+            name: "VibeWatchCompanionCoreVerification",
+            dependencies: ["VibeWatchCompanionCore"],
+            path: "Tests/VibeWatchCompanionCoreVerification"
+        ),
     ]
 )
