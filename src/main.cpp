@@ -106,6 +106,7 @@ String g_focusedApp;
 // FreeRTOS queue so JSON processing never blocks the NimBLE task.
 NimBLEServer* g_server = nullptr;
 NimBLEHIDDevice* g_hid = nullptr;
+NimBLECharacteristic* g_keyboardInput = nullptr;
 NimBLECharacteristic* g_vendorInput = nullptr;
 NimBLECharacteristic* g_vendorOutput = nullptr;
 NimBLECharacteristic* g_approvalResult = nullptr;
@@ -606,6 +607,19 @@ void sendFramedJson(String payload, bool appendCrlf,
     }
 }
 
+void sendStandardKeyboardKey(uint8_t modifiers, uint8_t keycode, bool pressed) {
+    if (!g_connected || g_keyboardInput == nullptr) {
+        return;
+    }
+    uint8_t report[8] = {};
+    if (pressed) {
+        report[0] = modifiers;
+        report[2] = keycode;
+    }
+    g_keyboardInput->setValue(report, sizeof(report));
+    g_keyboardInput->notify();
+}
+
 void sendKeyEvent(const char* key, bool pressed) {
     if (!g_connected || g_vendorInput == nullptr) {
         return;
@@ -634,12 +648,40 @@ void sendAgentEvent(int index, bool pressed) {
     char key[5];
     std::snprintf(key, sizeof(key), "AG%02d", index);
     sendKeyEvent(key, pressed);
+
+    // Standard BLE HID Key: F13..F18 and Ctrl+(1..6) for Workbuddy & Antigravity
+    if (index >= 0 && index < 6) {
+        if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
+            sendStandardKeyboardKey(0x01, 0x1E + index, pressed); // Ctrl + (1..6)
+        } else {
+            sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
+        }
+    }
 }
 
 void sendActionEvent(int index, bool pressed) {
     char key[6];
     std::snprintf(key, sizeof(key), "ACT%02d", index);
     sendKeyEvent(key, pressed);
+
+    // Standard BLE HID Key mappings for Workbuddy / Antigravity / macOS UI
+    if (index == 7) { // kOkAction (6 + 1)
+        sendStandardKeyboardKey(0x00, 0x28, pressed); // Return / Enter
+    } else if (index == 8) { // kNgAction (6 + 2)
+        sendStandardKeyboardKey(0x00, 0x29, pressed); // Escape
+    } else if (index == 6) { // FAST (6 + 0)
+        sendStandardKeyboardKey(0x00, 0x6F, pressed); // F20
+    } else if (index == 9) { // PLAN (6 + 3)
+        sendStandardKeyboardKey(0x00, 0x70, pressed); // F21
+    } else if (index == 12) { // AI assistant click
+        if (g_currentCard == CARD_ANTIGRAVITY) {
+            sendStandardKeyboardKey(0x08, 0x0E, pressed); // Cmd + K (Antigravity Prompt)
+        } else if (g_currentCard == CARD_WORKBUDDY) {
+            sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space (Workbuddy Voice/Assistant)
+        } else {
+            sendStandardKeyboardKey(0x00, 0x71, pressed); // F22
+        }
+    }
 }
 
 void sendMicEvent(bool pressed) {
@@ -648,6 +690,15 @@ void sendMicEvent(bool pressed) {
     // ACT11 cannot overwrite ACT10 in the controller buffer before delivery.
     delay(12);
     sendActionEvent(11, pressed);
+
+    // Standard BLE HID Key for Voice / Assistant Dictation:
+    if (g_currentCard == CARD_WORKBUDDY) {
+        sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space (Workbuddy Voice/Assistant)
+    } else if (g_currentCard == CARD_ANTIGRAVITY) {
+        sendStandardKeyboardKey(0x08, 0x0E, pressed); // Cmd + K (Antigravity Prompt)
+    } else {
+        sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS Dictation / Codex Assistant)
+    }
 }
 
 void sendJoystickEvent(float angle, float distance) {
@@ -1581,7 +1632,7 @@ void initializeBle() {
     addDeviceInfoCharacteristic(0x2A25, serial);
     addDeviceInfoCharacteristic(0x2A26, vibe::kFirmwareVersion);
 
-    auto* keyboardInput = g_hid->getInputReport(1);
+    g_keyboardInput = g_hid->getInputReport(1);
     auto* consumerInput = g_hid->getInputReport(2);
     auto* pointerInput = g_hid->getInputReport(3);
     g_vendorInput = g_hid->getInputReport(vibe::kVendorReportId);
@@ -1606,7 +1657,9 @@ void initializeBle() {
     const std::uint8_t consumerIdle[2] = {};
     const std::uint8_t pointerIdle[5] = {};
     const std::uint8_t vendorIdle[vibe::kBleReportLength] = {};
-    keyboardInput->setValue(keyboardIdle, sizeof(keyboardIdle));
+    if (g_keyboardInput != nullptr) {
+        g_keyboardInput->setValue(keyboardIdle, sizeof(keyboardIdle));
+    }
     consumerInput->setValue(consumerIdle, sizeof(consumerIdle));
     pointerInput->setValue(pointerIdle, sizeof(pointerIdle));
     g_vendorInput->setValue(vendorIdle, sizeof(vendorIdle));
