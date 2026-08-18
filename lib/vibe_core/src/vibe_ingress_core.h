@@ -59,12 +59,15 @@ class ApprovalIteration {
 };
 
 bool hidRpcMethodAllowed(const char* method);
+bool indicationTimeoutRequiresDisconnect(bool active, std::uint32_t nowMs,
+                                         std::uint32_t deadlineMs);
 
 struct HidStreamToken {
     std::uint16_t connectionHandle{0};
     std::uint32_t connectionGeneration{0};
     std::uint32_t streamEpoch{0};
     bool active{false};
+    bool acceptingChunks{false};
 };
 
 template <std::size_t Capacity>
@@ -85,6 +88,7 @@ class HidStreamTracker {
         }
         slot->streamEpoch = 1;
         slot->active = true;
+        slot->acceptingChunks = true;
         return token(*slot);
     }
 
@@ -92,17 +96,21 @@ class HidStreamTracker {
         Slot* slot = find(connectionHandle);
         if (slot != nullptr) {
             slot->active = false;
+            slot->acceptingChunks = false;
             ++slot->streamEpoch;
         }
     }
 
-    void noteEnqueueResult(std::uint16_t connectionHandle,
+    void noteEnqueueResult(const HidStreamToken& attempted,
                            EnqueueResult result) {
         if (result != EnqueueResult::QueueFull) {
             return;
         }
-        Slot* slot = find(connectionHandle);
-        if (slot != nullptr) {
+        Slot* slot = find(attempted.connectionHandle);
+        if (slot != nullptr && slot->active && slot->acceptingChunks &&
+            slot->connectionGeneration == attempted.connectionGeneration &&
+            slot->streamEpoch == attempted.streamEpoch) {
+            slot->acceptingChunks = false;
             ++slot->streamEpoch;
             if (slot->streamEpoch == 0) {
                 slot->streamEpoch = 1;
@@ -117,7 +125,7 @@ class HidStreamTracker {
 
     bool isCurrent(const HidChunk& chunk) const {
         const HidStreamToken value = current(chunk.connectionHandle);
-        return value.active &&
+        return value.active && value.acceptingChunks &&
                value.connectionGeneration == chunk.connectionGeneration &&
                value.streamEpoch == chunk.streamEpoch;
     }
@@ -128,6 +136,7 @@ class HidStreamTracker {
         std::uint16_t connectionHandle{0};
         std::uint32_t connectionGeneration{0};
         std::uint32_t streamEpoch{0};
+        bool acceptingChunks{false};
     };
 
     Slot* find(std::uint16_t connectionHandle) {
@@ -165,6 +174,7 @@ class HidStreamTracker {
         value.connectionGeneration = slot.connectionGeneration;
         value.streamEpoch = slot.streamEpoch;
         value.active = slot.active;
+        value.acceptingChunks = slot.acceptingChunks;
         return value;
     }
 

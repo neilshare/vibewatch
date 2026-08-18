@@ -343,7 +343,18 @@ void test_hid_rpc_rejects_all_legacy_approval_method_aliases() {
     TEST_ASSERT_TRUE(hidRpcMethodAllowed("quota"));
 }
 
-void test_hid_overflow_resets_stream_and_rejects_queued_old_epoch() {
+void test_indication_timeout_requires_active_disconnect() {
+    TEST_ASSERT_FALSE(indicationTimeoutRequiresDisconnect(
+        false, 5000, 5000));
+    TEST_ASSERT_FALSE(indicationTimeoutRequiresDisconnect(
+        true, 4999, 5000));
+    TEST_ASSERT_TRUE(indicationTimeoutRequiresDisconnect(
+        true, 5000, 5000));
+    TEST_ASSERT_TRUE(indicationTimeoutRequiresDisconnect(
+        true, 3, std::numeric_limits<std::uint32_t>::max() - 2));
+}
+
+void test_hid_overflow_rejects_suffix_until_new_connection_generation() {
     HidStreamTracker<3> streams;
     HidRpcAssembler assembler;
     HidRpcView completed{};
@@ -354,15 +365,24 @@ void test_hid_overflow_resets_stream_and_rejects_queued_old_epoch() {
         static_cast<std::uint8_t>(assembler.consume(
             hidChunk(beforeOverflow, R"json({"method":"old")json"), completed)));
 
-    streams.noteEnqueueResult(1, EnqueueResult::QueueFull);
+    streams.noteEnqueueResult(beforeOverflow, EnqueueResult::QueueFull);
     const auto afterOverflow = streams.current(1);
+    TEST_ASSERT_FALSE(afterOverflow.acceptingChunks);
     TEST_ASSERT_FALSE(streams.isCurrent(hidChunk(beforeOverflow, R"json(})json")));
-    TEST_ASSERT_TRUE(afterOverflow.streamEpoch != beforeOverflow.streamEpoch);
+    TEST_ASSERT_FALSE(streams.isCurrent(
+        hidChunk(afterOverflow, R"json({"method":"suffix"})json")));
+
+    assembler.clear(1);
+    streams.disconnect(1);
+    const auto reconnected = streams.connect(1);
+    TEST_ASSERT_TRUE(reconnected.acceptingChunks);
+    TEST_ASSERT_TRUE(reconnected.connectionGeneration !=
+                     beforeOverflow.connectionGeneration);
     TEST_ASSERT_EQUAL_UINT8(
         static_cast<std::uint8_t>(HidConsumeResult::Complete),
         static_cast<std::uint8_t>(assembler.consume(
-            hidChunk(afterOverflow, R"json({"method":"new"})json"), completed)));
-    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"new"})json", completed.data,
+            hidChunk(reconnected, R"json({"method":"fresh"})json"), completed)));
+    TEST_ASSERT_EQUAL_MEMORY(R"json({"method":"fresh"})json", completed.data,
                              completed.length);
 }
 
@@ -378,9 +398,11 @@ void test_hid_reconnect_generation_rejects_prior_handle_chunks() {
             hidChunk(firstConnection, R"json({"method":"stale")json"), completed)));
     streams.disconnect(2);
     const auto secondConnection = streams.connect(2);
+    streams.noteEnqueueResult(firstConnection, EnqueueResult::QueueFull);
 
     TEST_ASSERT_FALSE(streams.isCurrent(
         hidChunk(firstConnection, R"json(})json")));
+    TEST_ASSERT_TRUE(streams.current(2).acceptingChunks);
     TEST_ASSERT_TRUE(secondConnection.connectionGeneration !=
                      firstConnection.connectionGeneration);
     TEST_ASSERT_EQUAL_UINT8(
@@ -412,7 +434,8 @@ void setup() {
     RUN_TEST(test_encodes_bounded_v2_protocol_error);
     RUN_TEST(test_new_approval_cannot_expire_in_accepting_iteration_at_wrap);
     RUN_TEST(test_hid_rpc_rejects_all_legacy_approval_method_aliases);
-    RUN_TEST(test_hid_overflow_resets_stream_and_rejects_queued_old_epoch);
+    RUN_TEST(test_indication_timeout_requires_active_disconnect);
+    RUN_TEST(test_hid_overflow_rejects_suffix_until_new_connection_generation);
     RUN_TEST(test_hid_reconnect_generation_rejects_prior_handle_chunks);
     UNITY_END();
 }

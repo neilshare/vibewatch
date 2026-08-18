@@ -109,6 +109,30 @@ NimBLECharacteristic* g_vendorInput = nullptr;
 NimBLECharacteristic* g_vendorOutput = nullptr;
 NimBLECharacteristic* g_approvalResult = nullptr;
 
+class NoCopyCharacteristic final : public NimBLECharacteristic {
+  public:
+    NoCopyCharacteristic(const NimBLEUUID& uuid, std::uint16_t properties,
+                         std::uint16_t maxLength, NimBLEService* service)
+        : NimBLECharacteristic(uuid, properties, maxLength, service) {}
+
+    const NimBLEAttValue& valueReference() const { return getAttVal(); }
+};
+
+NoCopyCharacteristic* addNoCopyCharacteristic(
+    NimBLEService* service, const NimBLEUUID& uuid, std::uint16_t properties,
+    std::uint16_t maxLength) {
+    static const std::array<std::uint8_t, vibe::kIngressPayloadLength>
+        capacitySeed{};
+    auto* characteristic =
+        new NoCopyCharacteristic(uuid, properties, maxLength, service);
+    // NimBLE's writeEvent stores the incoming bytes before invoking onWrite.
+    // Reserve the full fixed capacity during setup so that store cannot grow
+    // the value buffer on the callback task.
+    characteristic->setValue(capacitySeed.data(), maxLength);
+    service->addCharacteristic(characteristic);
+    return characteristic;
+}
+
 bool g_connected = false;
 bool g_uiDirty = true;
 portMUX_TYPE g_callbackStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -121,7 +145,8 @@ struct CallbackConnection {
     bool configurePending{false};
     bool disconnectFallbackPending{false};
     std::uint32_t disconnectedGeneration{0};
-    bool hidResetPending{false};
+    bool hidDisconnectPending{false};
+    std::uint32_t hidDisconnectGeneration{0};
     bool approvalOverflowPending{false};
     std::uint32_t approvalOverflowGeneration{0};
     bool approvalIndicationsEnabled{false};
@@ -886,17 +911,22 @@ bool hidChunkCurrent(const vibe::HidChunk& chunk) {
     return current;
 }
 
-void publishHidEnqueueResult(std::uint16_t connectionHandle,
+void publishHidEnqueueResult(const vibe::HidStreamToken& attempted,
                              vibe::EnqueueResult result) {
     if (result != vibe::EnqueueResult::QueueFull) {
         return;
     }
     portENTER_CRITICAL(&g_callbackStateMux);
-    g_hidStreamTracker.noteEnqueueResult(connectionHandle, result);
+    g_hidStreamTracker.noteEnqueueResult(attempted, result);
     CallbackConnection* connection =
-        findCallbackConnectionLocked(connectionHandle);
-    if (connection != nullptr) {
-        connection->hidResetPending = true;
+        findCallbackConnectionLocked(attempted.connectionHandle);
+    if (connection != nullptr && connection->active &&
+        connection->connectionGeneration == attempted.connectionGeneration &&
+        !g_hidStreamTracker.current(attempted.connectionHandle)
+             .acceptingChunks) {
+        connection->hidDisconnectPending = true;
+        connection->hidDisconnectGeneration =
+            attempted.connectionGeneration;
     }
     portEXIT_CRITICAL(&g_callbackStateMux);
 }
@@ -1062,7 +1092,7 @@ void decidePendingApproval(vibe::ApprovalChoice choice) {
 
 void expirePendingApproval(std::uint32_t nowMs) {
     refreshIndicationTransportBlock();
-    if (g_pendingIndication.active || g_indicationTransportBlocked) {
+    if (g_pendingIndication.active) {
         return;
     }
     const vibe::ApprovalIteration iteration(nowMs);
@@ -1247,8 +1277,9 @@ void processIndicationTransport(std::uint32_t nowMs) {
             g_pendingIndication = {};
         }
     }
-    if (g_pendingIndication.active &&
-        static_cast<std::int32_t>(nowMs - g_pendingIndication.deadlineMs) >= 0) {
+    if (vibe::indicationTimeoutRequiresDisconnect(
+            g_pendingIndication.active, nowMs,
+            g_pendingIndication.deadlineMs)) {
         Serial.println("approval indication transport_error timeout");
         portENTER_CRITICAL(&g_callbackStateMux);
         if (g_callbackDeliveryId == g_pendingIndication.deliveryId) {
@@ -1262,6 +1293,12 @@ void processIndicationTransport(std::uint32_t nowMs) {
             g_pendingIndication.connectionGeneration;
         g_pendingIndication = {};
     }
+    refreshIndicationTransportBlock();
+    if (g_indicationTransportBlocked && g_server != nullptr &&
+        callbackConnectionCurrent(g_blockedIndicationConnection,
+                                  g_blockedIndicationGeneration)) {
+        g_server->disconnect(g_blockedIndicationConnection);
+    }
 }
 
 void processBleLifecycleEvents(std::uint32_t nowMs) {
@@ -1272,7 +1309,7 @@ void processBleLifecycleEvents(std::uint32_t nowMs) {
     for (auto& connection : g_callbackConnections) {
         connection.configurePending = false;
         connection.disconnectFallbackPending = false;
-        connection.hidResetPending = false;
+        connection.hidDisconnectPending = false;
         connection.approvalOverflowPending = false;
     }
     pairingSuccess = g_pairingSuccessPending;
@@ -1302,8 +1339,27 @@ void processBleLifecycleEvents(std::uint32_t nowMs) {
             Serial.printf("disconnect queue_full fallback handle=%u\n",
                           connection.connectionHandle);
         }
-        if (connection.hidResetPending) {
+        if (connection.hidDisconnectPending) {
             g_hidRpcAssembler.clear(connection.connectionHandle);
+            if (g_server != nullptr &&
+                callbackConnectionCurrent(
+                    connection.connectionHandle,
+                    connection.hidDisconnectGeneration)) {
+                if (!g_server->disconnect(connection.connectionHandle)) {
+                    portENTER_CRITICAL(&g_callbackStateMux);
+                    CallbackConnection* retry =
+                        findCallbackConnectionLocked(
+                            connection.connectionHandle);
+                    if (retry != nullptr && retry->active &&
+                        retry->connectionGeneration ==
+                            connection.hidDisconnectGeneration) {
+                        retry->hidDisconnectPending = true;
+                        retry->hidDisconnectGeneration =
+                            connection.hidDisconnectGeneration;
+                    }
+                    portEXIT_CRITICAL(&g_callbackStateMux);
+                }
+            }
         }
         if (connection.approvalOverflowPending &&
             !queueProtocolError("", vibe::ProtocolErrorCode::QueueFull,
@@ -1332,7 +1388,9 @@ void processBleLifecycleEvents(std::uint32_t nowMs) {
 class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* characteristic,
                  NimBLEConnInfo& connection) override {
-        const NimBLEAttValue& value = characteristic->getValue();
+        const NimBLEAttValue& value =
+            static_cast<NoCopyCharacteristic*>(characteristic)
+                ->valueReference();
         const auto* data = value.data();
         const std::size_t length = value.size();
         if (data == nullptr || length < 2 || data[0] != vibe::kChannelJsonRpc) {
@@ -1345,13 +1403,13 @@ class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
             return;
         }
         const auto token = currentConnectionToken(connection.getConnHandle());
-        if (!token.active) {
+        if (!token.active || !token.acceptingChunks) {
             return;
         }
         const auto result = vibe::enqueueHidChunk(
             token.connectionHandle, token.connectionGeneration,
             token.streamEpoch, data + 2, chunkLength);
-        publishHidEnqueueResult(token.connectionHandle, result);
+        publishHidEnqueueResult(token, result);
     }
 };
 
@@ -1375,7 +1433,9 @@ class GattWriteCallbacks : public NimBLECharacteristicCallbacks {
         if (!token.active) {
             return;
         }
-        const NimBLEAttValue& value = characteristic->getValue();
+        const NimBLEAttValue& value =
+            static_cast<NoCopyCharacteristic*>(characteristic)
+                ->valueReference();
         const auto result = vibe::enqueueGattWrite(
             kind_, token.connectionHandle, token.connectionGeneration,
             value.data(), value.size(), true);
@@ -1479,7 +1539,21 @@ void initializeBle() {
     auto* consumerInput = g_hid->getInputReport(2);
     auto* pointerInput = g_hid->getInputReport(3);
     g_vendorInput = g_hid->getInputReport(vibe::kVendorReportId);
-    g_vendorOutput = g_hid->getOutputReport(vibe::kVendorReportId);
+    auto* vendorOutput = addNoCopyCharacteristic(
+        g_hid->getHidService(), NimBLEUUID(static_cast<std::uint16_t>(0x2A4D)),
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+            NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::READ_ENC |
+            NIMBLE_PROPERTY::WRITE_ENC,
+        vibe::kBleReportLength);
+    auto* vendorOutputDescriptor = vendorOutput->createDescriptor(
+        NimBLEUUID(static_cast<std::uint16_t>(0x2908)),
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+            NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::WRITE_ENC);
+    const std::uint8_t vendorOutputDescriptorValue[] = {
+        vibe::kVendorReportId, 0x02};
+    vendorOutputDescriptor->setValue(vendorOutputDescriptorValue,
+                                     sizeof(vendorOutputDescriptorValue));
+    g_vendorOutput = vendorOutput;
     g_hid->getFeatureReport(vibe::kVendorReportId);
 
     const std::uint8_t keyboardIdle[8] = {};
@@ -1495,13 +1569,13 @@ void initializeBle() {
     updateBattery(false);
 
     auto* quotaService = g_server->createService(vibe::kQuotaServiceUuid);
-    auto* quotaCharacteristic = quotaService->createCharacteristic(
-        vibe::kQuotaWriteUuid,
+    auto* quotaCharacteristic = addNoCopyCharacteristic(
+        quotaService, NimBLEUUID(vibe::kQuotaWriteUuid),
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC,
         512);
     quotaCharacteristic->setCallbacks(&g_quotaCallbacks);
-    auto* approvalCharacteristic = quotaService->createCharacteristic(
-        vibe::kApprovalWriteUuid,
+    auto* approvalCharacteristic = addNoCopyCharacteristic(
+        quotaService, NimBLEUUID(vibe::kApprovalWriteUuid),
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC,
         512);
     approvalCharacteristic->setCallbacks(&g_approvalCallbacks);

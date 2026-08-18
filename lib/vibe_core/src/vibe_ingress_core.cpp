@@ -13,6 +13,12 @@ bool hidRpcMethodAllowed(const char* method) {
            std::strcmp(method, "v.oai.prompt") != 0;
 }
 
+bool indicationTimeoutRequiresDisconnect(bool active, std::uint32_t nowMs,
+                                         std::uint32_t deadlineMs) {
+    return active &&
+           static_cast<std::int32_t>(nowMs - deadlineMs) >= 0;
+}
+
 HidRpcAssembler::Assembly* HidRpcAssembler::findOrCreate(
     const HidChunk& chunk) {
     for (auto& assembly : assemblies_) {
