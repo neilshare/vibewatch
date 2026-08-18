@@ -169,22 +169,10 @@ std::uint32_t g_callbackDeliveryId{0};
 
 vibe::HidRpcAssembler g_hidRpcAssembler;
 
-inline QuotaSnapshot makeDefaultQuota(float remaining, std::uint32_t resetSec, float credits = 0.0f, float total = 0.0f) {
-    QuotaSnapshot q{};
-    q.remainingPercent = remaining;
-    q.resetInSeconds = resetSec;
-    q.credits = credits;
-    q.totalCredits = total;
-    q.hasCredits = (credits > 0.0f || total > 0.0f);
-    q.available = true;
-    q.receivedAtMs = 0;
-    return q;
-}
-
 std::array<CardState, CARD_COUNT> g_cards = {{
-    CardState("CODEX", 0x12D6B2, makeDefaultQuota(86.0f, 230400)),
-    CardState("WORKBUDDY", 0x00E5FF, makeDefaultQuota(83.3f, 0, 1250.0f, 1500.0f)),
-    CardState("ANTIGRAVITY", 0x9D74FF, makeDefaultQuota(100.0f, 259200))
+    CardState("CODEX", 0x12D6B2, QuotaSnapshot{}),
+    CardState("WORKBUDDY", 0x00E5FF, QuotaSnapshot{}),
+    CardState("ANTIGRAVITY", 0x9D74FF, QuotaSnapshot{})
 }};
 
 AgentCard g_currentCard = CARD_CODEX;
@@ -384,8 +372,8 @@ constexpr int kSwipeThresholdPx = 45;
 std::uint32_t g_lastActivityAt = 0;
 bool g_isDimmed = false;
 bool g_isScreenSleeping = false;
-constexpr std::uint32_t kDimTimeoutMs = 60000;
-constexpr std::uint32_t kSleepTimeoutMs = 180000;
+constexpr std::uint32_t kDimTimeoutMs = 180000;
+constexpr std::uint32_t kSleepTimeoutMs = 300000;
 
 void noteActivity() {
     g_lastActivityAt = millis();
