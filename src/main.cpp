@@ -16,6 +16,7 @@
 #include "vibe_ingress.h"
 #include "vibe_approval.h"
 #include "vibe_protocol.h"
+#include "vibe_render.h"
 #include "vibe_state.h"
 #include "sound.h"
 
@@ -64,7 +65,7 @@ using vibe::Language;
 using vibe::LANG_ZH;
 using vibe::LANG_EN;
 using vibe::AgentState;
-using vibe::QuotaState;
+using vibe::QuotaSnapshot;
 using vibe::CardState;
 using vibe::ApprovalState;
 
@@ -167,9 +168,9 @@ std::uint32_t g_callbackDeliveryId{0};
 vibe::HidRpcAssembler g_hidRpcAssembler;
 
 std::array<CardState, CARD_COUNT> g_cards = {{
-    CardState("CODEX", 0x12D6B2, QuotaState(86.0f, 369286, 0, true)),
-    CardState("WORKBUDDY", 0x00E5FF, QuotaState(85.0f, 0, 0, true, 1250.0f, 1500.0f, true)),
-    CardState("ANTIGRAVITY", 0x9D74FF, QuotaState(78.0f, 198000, 0, true))
+    CardState("CODEX", 0x12D6B2, QuotaSnapshot{}),
+    CardState("WORKBUDDY", 0x00E5FF, QuotaSnapshot{}),
+    CardState("ANTIGRAVITY", 0x9D74FF, QuotaSnapshot{})
 }};
 
 AgentCard g_currentCard = CARD_CODEX;
@@ -216,26 +217,32 @@ void applyQuotaStatus(JsonVariantConst params) {
         }
     }
 
-    if (credits >= 0.0f) {
-        g_cards[targetCard].quota.credits = credits;
-        g_cards[targetCard].quota.hasCredits = true;
-        if (totalCredits > 0.0f) {
-            g_cards[targetCard].quota.totalCredits = totalCredits;
-            if (remaining < 0.0f) {
-                remaining = std::max(0.0f, std::min(100.0f, (credits / totalCredits) * 100.0f));
-            }
+    const bool hasCreditFields = credits >= 0.0f || totalCredits >= 0.0f;
+    float snapshotCredits = 0.0f;
+    float snapshotTotalCredits = 0.0f;
+    if (hasCreditFields) {
+        if (credits < 0.0f || totalCredits <= 0.0f) {
+            Serial.printf("Quota update for %s rejected: incomplete credit snapshot\n",
+                          g_cards[targetCard].name);
+            return;
+        }
+        snapshotCredits = credits;
+        snapshotTotalCredits = totalCredits;
+        if (remaining < 0.0f) {
+            remaining = std::max(0.0f, std::min(100.0f,
+                                                (credits / totalCredits) * 100.0f));
         }
     }
 
-    if (remaining >= 0.0f && remaining <= 100.0f) {
-        g_cards[targetCard].quota.remainingPercent = remaining;
-        g_cards[targetCard].quota.resetInSeconds = resetSec;
-        g_cards[targetCard].quota.receivedAtMs = millis();
-        g_cards[targetCard].quota.available = true;
-        g_uiDirty = true;
-        Serial.printf("Quota update for %s: %.1f%% credits=%.1f resetIn=%us\n",
-                      g_cards[targetCard].name, remaining, g_cards[targetCard].quota.credits, resetSec);
+    auto& quota = g_cards[targetCard].quota;
+    if (!quota.apply(remaining, resetSec, snapshotCredits, snapshotTotalCredits, millis())) {
+        Serial.printf("Quota update for %s rejected: invalid snapshot\n",
+                      g_cards[targetCard].name);
+        return;
     }
+    g_uiDirty = true;
+    Serial.printf("Quota update for %s: %.1f%% credits=%.1f resetIn=%us\n",
+                  g_cards[targetCard].name, remaining, quota.credits, resetSec);
 }
 
 void noteActivity();
@@ -2874,6 +2881,9 @@ void renderUi(std::uint32_t now) {
             const int fillBlue = (fill & 0x1F) * 255 / 31;
             const int fillLuminance = (fillRed * 299 + fillGreen * 587 + fillBlue * 114) / 1000;
             const auto labelColor = fillLuminance >= 150 ? TFT_BLACK : TFT_WHITE;
+            M5.Display.setFont(&fonts::Orbitron_Light_32);
+            M5.Display.setTextSize(vibe::kAgentLabelTextScale);
+            M5.Display.setTextDatum(middle_center);
             M5.Display.setTextColor(labelColor);
             char label[2];
             std::snprintf(label, sizeof(label), "%d", i + 1);
@@ -2884,13 +2894,21 @@ void renderUi(std::uint32_t now) {
     }
 
     if (!g_actionLayer) {
+        M5.Display.setFont(&fonts::Orbitron_Light_32);
+        M5.Display.setTextSize(vibe::kActionLabelTextScale);
+        M5.Display.setTextDatum(middle_center);
+    }
+
+    if (!g_actionLayer) {
         drawSelectionIndicator(now);
     }
 
     // Draw Quota orbital gauge ring for active card
     const auto& quota = currentCard.quota;
-    const bool quotaStale = quota.available && (now - quota.receivedAtMs > kQuotaStaleAfterMs);
-    if (quota.available && !g_actionLayer) {
+    const auto quotaFreshness = quota.freshness(now, kQuotaStaleAfterMs);
+    const bool quotaAvailable = quotaFreshness != vibe::QuotaFreshness::Unavailable;
+    const bool quotaStale = quotaFreshness == vibe::QuotaFreshness::Stale;
+    if (quotaAvailable && !g_actionLayer) {
         constexpr int kQuotaOuterR = 82;
         constexpr int kQuotaInnerR = 76;
         const auto trackColor = M5.Display.color565(38, 50, 61);
@@ -2918,11 +2936,22 @@ void renderUi(std::uint32_t now) {
     drawThickCircle(kScreenCenter, kScreenCenter, kMicButtonRadius, micPressed ? 7 : 4,
                     micPressed ? TFT_WHITE : micAccent);
 
-    if (quota.available && !micPressed && !g_actionLayer) {
+    if (!micPressed && !g_actionLayer) {
         const auto textColor = quotaStale ? M5.Display.color565(180, 150, 100) : currentPrimaryColor;
         const auto mutedColor = M5.Display.color565(130, 142, 160);
 
-        if (g_currentCard == CARD_WORKBUDDY || quota.hasCredits) {
+        if (!quotaAvailable) {
+            M5.Display.setTextColor(mutedColor, micFill);
+            if (g_language == LANG_ZH) {
+                M5.Display.setFont(&fonts::efontCN_16);
+                M5.Display.setTextSize(1.0f);
+                M5.Display.drawString("等待同步", kScreenCenter, kScreenCenter - 1);
+            } else {
+                M5.Display.setFont(&fonts::Orbitron_Light_24);
+                M5.Display.setTextSize(0.58f);
+                M5.Display.drawString("SYNC WAIT", kScreenCenter, kScreenCenter - 1);
+            }
+        } else if (quota.hasCredits) {
             // Workbuddy Credit Mode:
             // Top line: Pure technical label "CREDITS"
             M5.Display.setFont(&fonts::Orbitron_Light_24);
@@ -2932,7 +2961,7 @@ void renderUi(std::uint32_t now) {
 
             // Center line: Large Credit count e.g. "1250" or "850"
             char creditText[20];
-            const float crVal = quota.credits > 0.0f ? quota.credits : (quota.remainingPercent * 15.0f);
+            const float crVal = quota.credits;
             if (crVal >= 10000.0f) {
                 std::snprintf(creditText, sizeof(creditText), "%.1fK", crVal / 1000.0f);
             } else {
@@ -2972,7 +3001,7 @@ void renderUi(std::uint32_t now) {
 
             // Bottom line: Minimal concise countdown e.g. "RESET 1H 00M"
             char resetStr[24];
-            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+            const std::uint32_t elapsed = (now - quota.receivedAtMs) / 1000;
             const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
             formatResetCountdown(remSec, resetStr, sizeof(resetStr));
 

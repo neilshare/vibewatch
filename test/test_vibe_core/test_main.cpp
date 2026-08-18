@@ -7,6 +7,7 @@
 #include "vibe_ingress_core.h"
 #include "vibe_protocol.h"
 #include "vibe_quota.h"
+#include "vibe_render.h"
 
 using namespace vibe;
 
@@ -211,6 +212,27 @@ void test_quota_defaults_apply_validation_and_freshness() {
                             static_cast<std::uint8_t>(quota.freshness(1100, 100)));
     TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Stale),
                             static_cast<std::uint8_t>(quota.freshness(1101, 100)));
+}
+
+void test_quota_snapshot_truthfully_reports_startup_and_staleness() {
+    QuotaSnapshot quota{};
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Unavailable),
+                            static_cast<std::uint8_t>(quota.freshness(0, 180000)));
+
+    TEST_ASSERT_TRUE(quota.apply(86.0f, 3600, 0.0f, 0.0f, 1000));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Fresh),
+                            static_cast<std::uint8_t>(quota.freshness(181000, 180000)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaFreshness::Stale),
+                            static_cast<std::uint8_t>(quota.freshness(181001, 180000)));
+
+    TEST_ASSERT_FALSE(quota.apply(101.0f, 1, 0.0f, 0.0f, 2000));
+    TEST_ASSERT_EQUAL_FLOAT(86.0f, quota.remainingPercent);
+    TEST_ASSERT_EQUAL_UINT32(1000, quota.receivedAtMs);
+}
+
+void test_agent_label_scale_preserves_action_label_scale() {
+    TEST_ASSERT_EQUAL_FLOAT(2.0f, kAgentLabelTextScale);
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, kActionLabelTextScale);
 }
 
 void test_quota_accepts_a_snapshot_without_credit_fields() {
@@ -425,6 +447,8 @@ void setup() {
     RUN_TEST(test_encodes_the_canonical_v2_decision);
     RUN_TEST(test_rejects_a_non_terminated_decision_id);
     RUN_TEST(test_quota_defaults_apply_validation_and_freshness);
+    RUN_TEST(test_quota_snapshot_truthfully_reports_startup_and_staleness);
+    RUN_TEST(test_agent_label_scale_preserves_action_label_scale);
     RUN_TEST(test_quota_accepts_a_snapshot_without_credit_fields);
     RUN_TEST(test_wraparound_expiry_and_quota_freshness);
     RUN_TEST(test_ingress_buffer_is_bounded_and_fifo);
