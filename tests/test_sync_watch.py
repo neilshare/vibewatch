@@ -95,6 +95,18 @@ def test_invalid_request_is_usage_failure_before_transport(argv, monkeypatch):
     assert sync_watch.main(argv) == 2
 
 
+@pytest.mark.parametrize("option", ["--credits", "--total-credits"])
+@pytest.mark.parametrize("backend", ["native", "bleak"])
+def test_non_double_numeric_value_is_rejected_before_backend(option, backend, monkeypatch, capsys):
+    monkeypatch.setattr(sync_watch, "run_native", lambda *_: pytest.fail("native called"))
+    monkeypatch.setattr(sync_watch, "run_bleak", lambda *_: pytest.fail("bleak called"))
+
+    assert sync_watch.main([
+        "--backend", backend, "--auto", option, "1e10000", "--device-id", VALID_UUID,
+    ]) == 2
+    assert "finite double" in capsys.readouterr().err.lower()
+
+
 def test_bleak_backend_is_selected_only_when_explicit(monkeypatch):
     calls = []
     monkeypatch.setattr(sync_watch, "run_native", lambda *_: pytest.fail("native called"))
@@ -121,10 +133,15 @@ def test_native_build_failure_is_returned(monkeypatch, tmp_path):
 
 
 class FakeBleakClient:
-    def __init__(self, approval_result=None, connected=True, write_error=None):
+    def __init__(
+        self, approval_result=None, connected=True, write_error=None,
+        stop_error=None, exit_error=None,
+    ):
         self.approval_result = approval_result
         self.is_connected = connected
         self.write_error = write_error
+        self.stop_error = stop_error
+        self.exit_error = exit_error
         self.events = []
         self.callback = None
 
@@ -134,6 +151,8 @@ class FakeBleakClient:
 
     async def __aexit__(self, *_):
         self.events.append(("disconnect",))
+        if self.exit_error is not None:
+            raise self.exit_error
 
     async def start_notify(self, characteristic, callback):
         self.events.append(("subscribe", characteristic))
@@ -141,6 +160,8 @@ class FakeBleakClient:
 
     async def stop_notify(self, characteristic):
         self.events.append(("unsubscribe", characteristic))
+        if self.stop_error is not None:
+            raise self.stop_error
 
     async def write_gatt_char(self, characteristic, payload, response):
         self.events.append(("write", characteristic, json.loads(payload), response))
@@ -221,6 +242,43 @@ def test_bleak_v2_approval_subscribes_before_response_write_and_correlates(capsy
     assert json.loads(capsys.readouterr().out) == result
 
 
+@pytest.mark.parametrize("cleanup", ["stop", "disconnect"])
+def test_bleak_valid_decision_survives_cleanup_failure(cleanup, capsys):
+    result = {
+        "version": 2, "kind": "approval_decision", "request_id": VALID_UUID,
+        "decision": "approve", "decided_at_ms": 123,
+    }
+    cleanup_error = Exception(f"{cleanup} failed")
+    client = FakeBleakClient(
+        approval_result=result,
+        stop_error=cleanup_error if cleanup == "stop" else None,
+        exit_error=cleanup_error if cleanup == "disconnect" else None,
+    )
+    adapter = FakeBleakAdapter(client)
+    request = sync_watch.build_request(sync_watch.parse_args([
+        "--backend", "bleak", "--approval", "--request-id", VALID_UUID,
+        "--summary", "Run", "--ttl-ms", "5000", "--device-id", VALID_UUID,
+    ]))
+
+    assert sync_watch.run_bleak(request, adapter) == 0
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_bleak_primary_transport_error_survives_cleanup_failure(capsys):
+    client = FakeBleakClient(
+        approval_result=None, write_error=Exception("write denied"),
+        stop_error=Exception("stop failed"), exit_error=Exception("disconnect failed"),
+    )
+    adapter = FakeBleakAdapter(client)
+    request = sync_watch.build_request(sync_watch.parse_args([
+        "--backend", "bleak", "--approval", "--request-id", VALID_UUID,
+        "--summary", "Run", "--ttl-ms", "5000", "--device-id", VALID_UUID,
+    ]))
+
+    assert sync_watch.run_bleak(request, adapter) == 1
+    assert json.loads(capsys.readouterr().err)["message"] == "write denied"
+
+
 def test_bleak_approval_ignores_mismatched_request_id(capsys):
     client = FakeBleakClient(approval_result={
         "version": 2, "kind": "approval_decision",
@@ -249,6 +307,65 @@ def test_bleak_approval_rejects_malformed_matching_decision(capsys):
 
     assert sync_watch.run_bleak(request, adapter, timeout_override=0.01) == 1
     assert "matching approval" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize("request_id", ["", VALID_UUID])
+def test_bleak_approval_accepts_well_formed_empty_or_matching_protocol_error(request_id, capsys):
+    client = FakeBleakClient(approval_result={
+        "version": 2, "kind": "error", "request_id": request_id,
+        "code": "busy", "message": "Another approval is pending.",
+    })
+    adapter = FakeBleakAdapter(client)
+    request = sync_watch.build_request(sync_watch.parse_args([
+        "--backend", "bleak", "--approval", "--request-id", VALID_UUID,
+        "--summary", "Run", "--ttl-ms", "5000", "--device-id", VALID_UUID,
+    ]))
+
+    assert sync_watch.run_bleak(request, adapter) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error["code"] == "busy"
+    assert error["message"] == "Another approval is pending."
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"version": 2, "kind": "error", "code": "busy", "message": "Busy"},
+        {"version": 2, "kind": "error", "request_id": None, "code": "busy", "message": "Busy"},
+        {"version": 2, "kind": "error", "request_id": VALID_UUID, "code": 7, "message": "Busy"},
+        {"version": 2, "kind": "error", "request_id": VALID_UUID, "code": "busy"},
+    ],
+)
+def test_bleak_approval_rejects_malformed_protocol_error(malformed, capsys):
+    client = FakeBleakClient(approval_result=malformed)
+    adapter = FakeBleakAdapter(client)
+    request = sync_watch.build_request(sync_watch.parse_args([
+        "--backend", "bleak", "--approval", "--request-id", VALID_UUID,
+        "--summary", "Run", "--ttl-ms", "5000", "--device-id", VALID_UUID,
+    ]))
+
+    assert sync_watch.run_bleak(request, adapter) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error["code"] == "transport_error"
+    assert "malformed" in error["message"].lower()
+
+
+def test_bleak_approval_ignores_well_formed_mismatched_protocol_error(capsys):
+    client = FakeBleakClient(approval_result={
+        "version": 2, "kind": "error",
+        "request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "code": "busy", "message": "Unrelated request",
+    })
+    adapter = FakeBleakAdapter(client)
+    request = sync_watch.build_request(sync_watch.parse_args([
+        "--backend", "bleak", "--approval", "--request-id", VALID_UUID,
+        "--summary", "Run", "--ttl-ms", "5000", "--device-id", VALID_UUID,
+    ]))
+
+    assert sync_watch.run_bleak(request, adapter, timeout_override=0.01) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error["code"] == "transport_error"
+    assert "matching approval" in error["message"].lower()
 
 
 def test_bleak_legacy_approval_is_ack_only_on_new_characteristic(capsys):

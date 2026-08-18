@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -135,6 +136,12 @@ def _decimal(raw: str | None, option: str, minimum: Decimal, maximum: Decimal | 
         if maximum is None:
             raise UsageFailure(f"{option} must be at least {minimum}")
         raise UsageFailure(f"{option} must be between {minimum} and {maximum}")
+    try:
+        double_value = float(value)
+    except (OverflowError, ValueError) as error:
+        raise UsageFailure(f"{option} must be representable as a finite Double") from error
+    if not math.isfinite(double_value):
+        raise UsageFailure(f"{option} must be representable as a finite Double")
     return str(value)
 
 
@@ -375,7 +382,11 @@ async def _run_bleak(
     if device is None:
         raise TransportFailure("device_not_found", "Pinned Bluetooth device was not found.")
 
-    async with adapter.client(device) as client:
+    delivered_decision: dict[str, Any] | None = None
+    client_context = adapter.client(device)
+    client = await client_context.__aenter__()
+    primary_error: BaseException | None = None
+    try:
         if not client.is_connected:
             raise TransportFailure("transport_error", "Bluetooth connection failed.")
         if isinstance(request, (ManualQuotaRequest, DemoDiscoveryRequest)):
@@ -409,6 +420,8 @@ async def _run_bleak(
                 message = json.loads(bytes(raw))
             except (TypeError, ValueError, UnicodeDecodeError):
                 return
+            if not isinstance(message, dict):
+                return
             if message.get("version") != 2:
                 return
             if message.get("kind") == "approval_decision":
@@ -422,28 +435,57 @@ async def _run_bleak(
                 ):
                     return
                 loop.call_soon_threadsafe(lambda: not result.done() and result.set_result(message))
-            elif message.get("kind") == "error" and message.get("request_id") in (None, "", request_id):
-                code = str(message.get("code") or "transport_error")
-                detail = str(message.get("message") or "Approval request failed.")
+            elif message.get("kind") == "error":
+                raw_id = message.get("request_id")
+                if "request_id" not in message or not isinstance(raw_id, str):
+                    error = TransportFailure("transport_error", "Malformed approval error indication.")
+                elif raw_id not in ("", request_id):
+                    return
+                elif not isinstance(message.get("code"), str) or not isinstance(message.get("message"), str):
+                    error = TransportFailure("transport_error", "Malformed approval error indication.")
+                else:
+                    error = TransportFailure(message["code"], message["message"])
                 loop.call_soon_threadsafe(
-                    lambda: not result.done() and result.set_exception(TransportFailure(code, detail))
+                    lambda: not result.done() and result.set_exception(error)
                 )
 
         subscribed = False
+        approval_error: BaseException | None = None
         try:
             await client.start_notify(APPROVAL_RESULT_UUID, receive)
             subscribed = True
             await client.write_gatt_char(APPROVAL_WRITE_UUID, _json_bytes(payload), response=True)
             timeout = timeout_override if timeout_override is not None else request.ttl_ms / 1_000 + 5
             try:
-                return await asyncio.wait_for(result, timeout=timeout)
+                delivered_decision = await asyncio.wait_for(result, timeout=timeout)
+                return delivered_decision
             except asyncio.TimeoutError as error:
                 raise TransportFailure(
                     "transport_error", "Timed out waiting for a matching approval decision."
                 ) from error
+        except BaseException as error:
+            approval_error = error
+            raise
         finally:
             if subscribed:
-                await client.stop_notify(APPROVAL_RESULT_UUID)
+                try:
+                    await client.stop_notify(APPROVAL_RESULT_UUID)
+                except Exception:
+                    if approval_error is None and delivered_decision is None:
+                        raise
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            await client_context.__aexit__(
+                type(primary_error) if primary_error is not None else None,
+                primary_error,
+                primary_error.__traceback__ if primary_error is not None else None,
+            )
+        except Exception:
+            if primary_error is None and delivered_decision is None:
+                raise
 
 
 def run_bleak(
