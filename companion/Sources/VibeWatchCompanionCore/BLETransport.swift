@@ -82,8 +82,12 @@ public final class ApprovalResultMatcher {
                   decision.requestID == requestID else { return nil }
             indication = .decision(decision)
         case "error":
+            // Firmware cannot recover a request ID from queue-full or
+            // undecodable payloads. This matcher exists for exactly one
+            // in-flight transaction, so an empty ID is associated here only;
+            // every nonempty ID must still match exactly.
             guard let error = try? decoder.decode(ApprovalProtocolErrorV2.self, from: data),
-                  error.requestID == requestID else { return nil }
+                  error.requestID == nil || error.requestID == requestID else { return nil }
             indication = .protocolError(error)
         default:
             return nil

@@ -27,7 +27,7 @@ public enum Task4Scenarios {
             return 7
         case .approvalTransportAndRunner:
             try runApprovalTransportAndRunnerScenarios()
-            return 13
+            return 16
         }
     }
 
@@ -284,8 +284,29 @@ public enum Task4Scenarios {
         )
 
         for (code, message) in [
+            ("queue_full", "Approval queue is full."),
+            ("invalid_payload", "Approval payload is invalid."),
+            ("unsupported_version", "Approval protocol version is unsupported."),
+        ] {
+            let emptyIDError = ApprovalProtocolErrorV2(
+                requestID: nil, code: code, message: message
+            )
+            let inFlightMatcher = ApprovalResultMatcher(requestID: requestID)
+            try check(
+                inFlightMatcher.receive(try encoder.encode(unrelatedError)) == nil,
+                "\(code) matcher accepted a nonempty mismatched request ID"
+            )
+            try check(
+                inFlightMatcher.receive(try encoder.encode(emptyIDError)) == .protocolError(emptyIDError),
+                "empty-ID firmware \(code) error was not associated with the unique in-flight transaction"
+            )
+        }
+
+        for (code, message) in [
             ("busy", "Another approval is pending."),
             ("queue_full", "Approval queue is full."),
+            ("invalid_payload", "Approval payload is invalid."),
+            ("unsupported_version", "Approval protocol version is unsupported."),
         ] {
             let firmwareFailure = FakeTransport(
                 approvalResult: .failure(BLETransportError.protocolError(code: code, message: message))
