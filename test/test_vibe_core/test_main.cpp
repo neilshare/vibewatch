@@ -231,8 +231,27 @@ void test_quota_snapshot_truthfully_reports_startup_and_staleness() {
 }
 
 void test_agent_label_scale_preserves_action_label_scale() {
-    TEST_ASSERT_EQUAL_FLOAT(2.0f, kAgentLabelTextScale);
-    TEST_ASSERT_EQUAL_FLOAT(1.0f, kActionLabelTextScale);
+    const auto agentStyle = normalAgentLabelRenderStyle();
+    const auto actionStyle = actionLabelRenderStyle();
+    TEST_ASSERT_EQUAL_FLOAT(2.0f, agentStyle.textScale);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(RenderFont::OrbitronLight32),
+                            static_cast<std::uint8_t>(agentStyle.font));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(RenderTextDatum::MiddleCenter),
+                            static_cast<std::uint8_t>(agentStyle.datum));
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, actionStyle.textScale);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(RenderFont::OrbitronLight32),
+                            static_cast<std::uint8_t>(actionStyle.font));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(RenderTextDatum::MiddleCenter),
+                            static_cast<std::uint8_t>(actionStyle.datum));
+}
+
+void test_quota_presentation_marks_only_stale_data_as_stale() {
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaPresentation::Unavailable),
+                            static_cast<std::uint8_t>(quotaPresentation(QuotaFreshness::Unavailable)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaPresentation::Current),
+                            static_cast<std::uint8_t>(quotaPresentation(QuotaFreshness::Fresh)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(QuotaPresentation::Stale),
+                            static_cast<std::uint8_t>(quotaPresentation(QuotaFreshness::Stale)));
 }
 
 void test_quota_accepts_a_snapshot_without_credit_fields() {
@@ -449,6 +468,7 @@ void setup() {
     RUN_TEST(test_quota_defaults_apply_validation_and_freshness);
     RUN_TEST(test_quota_snapshot_truthfully_reports_startup_and_staleness);
     RUN_TEST(test_agent_label_scale_preserves_action_label_scale);
+    RUN_TEST(test_quota_presentation_marks_only_stale_data_as_stale);
     RUN_TEST(test_quota_accepts_a_snapshot_without_credit_fields);
     RUN_TEST(test_wraparound_expiry_and_quota_freshness);
     RUN_TEST(test_ingress_buffer_is_bounded_and_fifo);

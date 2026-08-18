@@ -2577,6 +2577,27 @@ void renderSettingsUi() {
     const auto panelBorder = M5.Display.color565(118, 124, 142);
     const auto purple = M5.Display.color565(145, 120, 255);
     const auto muted = M5.Display.color565(205, 210, 222);
+    const auto& quota = g_cards[g_currentCard].quota;
+    const auto quotaState = vibe::quotaPresentation(
+        quota.freshness(millis(), kQuotaStaleAfterMs));
+    const bool hasSettingsQuota = quotaState != vibe::QuotaPresentation::Unavailable;
+    char quotaLine[64]{};
+    if (hasSettingsQuota) {
+        if (quotaState == vibe::QuotaPresentation::Stale) {
+            std::snprintf(quotaLine, sizeof(quotaLine),
+                          g_language == LANG_ZH ? "%s: %.0f%% (数据过期)"
+                                                : "%s: %.0f%% (SYNC STALE)",
+                          g_cards[g_currentCard].name, quota.remainingPercent);
+        } else {
+            char resetStr[24];
+            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
+            const std::uint32_t remSec = elapsed >= quota.resetInSeconds
+                ? 0 : quota.resetInSeconds - elapsed;
+            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
+            std::snprintf(quotaLine, sizeof(quotaLine), "%s: %.0f%% (%s)",
+                          g_cards[g_currentCard].name, quota.remainingPercent, resetStr);
+        }
+    }
 
     M5.Display.setTextDatum(middle_center);
     if (g_language == LANG_ZH) {
@@ -2588,14 +2609,7 @@ void renderSettingsUi() {
         M5.Display.setFont(&fonts::efontCN_16);
         M5.Display.setTextSize(1.0f);
         M5.Display.setTextColor(muted, TFT_BLACK);
-        const auto& quota = g_cards[g_currentCard].quota;
-        if (quota.available) {
-            char resetStr[24];
-            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
-            const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
-            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
-            char quotaLine[48];
-            std::snprintf(quotaLine, sizeof(quotaLine), "%s: %.0f%% (%s)", g_cards[g_currentCard].name, quota.remainingPercent, resetStr);
+        if (hasSettingsQuota) {
             M5.Display.drawString(quotaLine, kScreenCenter, 72);
         } else {
             M5.Display.drawString("蓝牙设备槽位", kScreenCenter, 72);
@@ -2609,14 +2623,7 @@ void renderSettingsUi() {
         M5.Display.setFont(&fonts::DejaVu18);
         M5.Display.setTextSize(0.78f);
         M5.Display.setTextColor(muted, TFT_BLACK);
-        const auto& quota = g_cards[g_currentCard].quota;
-        if (quota.available) {
-            char resetStr[24];
-            const std::uint32_t elapsed = (millis() - quota.receivedAtMs) / 1000;
-            const std::uint32_t remSec = elapsed >= quota.resetInSeconds ? 0 : quota.resetInSeconds - elapsed;
-            formatResetCountdown(remSec, resetStr, sizeof(resetStr));
-            char quotaLine[48];
-            std::snprintf(quotaLine, sizeof(quotaLine), "%s: %.0f%% (%s)", g_cards[g_currentCard].name, quota.remainingPercent, resetStr);
+        if (hasSettingsQuota) {
             M5.Display.drawString(quotaLine, kScreenCenter, 72);
         } else {
             M5.Display.drawString("BLUETOOTH DEVICE", kScreenCenter, 72);
@@ -2876,13 +2883,14 @@ void renderUi(std::uint32_t now) {
             M5.Display.setFont(&fonts::Orbitron_Light_32);
             M5.Display.setTextSize(1);
         } else {
+            const auto labelStyle = vibe::normalAgentLabelRenderStyle();
             const int fillRed = ((fill >> 11) & 0x1F) * 255 / 31;
             const int fillGreen = ((fill >> 5) & 0x3F) * 255 / 63;
             const int fillBlue = (fill & 0x1F) * 255 / 31;
             const int fillLuminance = (fillRed * 299 + fillGreen * 587 + fillBlue * 114) / 1000;
             const auto labelColor = fillLuminance >= 150 ? TFT_BLACK : TFT_WHITE;
             M5.Display.setFont(&fonts::Orbitron_Light_32);
-            M5.Display.setTextSize(vibe::kAgentLabelTextScale);
+            M5.Display.setTextSize(labelStyle.textScale);
             M5.Display.setTextDatum(middle_center);
             M5.Display.setTextColor(labelColor);
             char label[2];
@@ -2894,8 +2902,9 @@ void renderUi(std::uint32_t now) {
     }
 
     if (!g_actionLayer) {
+        const auto actionStyle = vibe::actionLabelRenderStyle();
         M5.Display.setFont(&fonts::Orbitron_Light_32);
-        M5.Display.setTextSize(vibe::kActionLabelTextScale);
+        M5.Display.setTextSize(actionStyle.textScale);
         M5.Display.setTextDatum(middle_center);
     }
 
