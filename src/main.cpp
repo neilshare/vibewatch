@@ -663,10 +663,10 @@ void sendAgentEvent(int index, bool pressed) {
     std::snprintf(key, sizeof(key), "AG%02d", index);
     sendKeyEvent(key, pressed);
 
-    // Standard BLE HID Key: F13..F18 and Ctrl+(1..6) for Workbuddy & Antigravity
+    // Standard BLE HID Key: Send standard digit keys '1'..'6' (0x1E..0x23) and F13..F18
     if (index >= 0 && index < 6) {
         if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
-            sendStandardKeyboardKey(0x01, 0x1E + index, pressed); // Ctrl + (1..6)
+            sendStandardKeyboardKey(0x00, 0x1E + index, pressed); // Direct standard digits '1'..'6'
         } else {
             sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
         }
@@ -689,11 +689,11 @@ void sendActionEvent(int index, bool pressed) {
         sendStandardKeyboardKey(0x00, 0x70, pressed); // F21
     } else if (index == 12) { // AI assistant single tap
         if (g_currentCard == CARD_ANTIGRAVITY) {
-            sendConsumerKey(0x00CF, pressed); // Voice Command / Dictation
-            sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS Global Dictation Hotkey)
+            // Antigravity prompt focus: send Return or standard Enter
+            sendStandardKeyboardKey(0x00, 0x28, pressed);
         } else if (g_currentCard == CARD_WORKBUDDY) {
-            sendConsumerKey(0x00CF, pressed); // Voice Command / Dictation
-            sendStandardKeyboardKey(0x04, 0x2C, pressed); // Option + Space
+            // Workbuddy single click: send Return or standard Enter
+            sendStandardKeyboardKey(0x00, 0x28, pressed);
         } else {
             sendStandardKeyboardKey(0x00, 0x71, pressed); // F22
         }
@@ -707,10 +707,9 @@ void sendMicEvent(bool pressed) {
     delay(12);
     sendActionEvent(11, pressed);
 
-    // Standard Voice Dictation: Consumer Voice Command (0x00CF) + F19 (macOS Dictation)
-    // Avoids unintended Command+N / Command+K window spawns!
-    sendConsumerKey(0x00CF, pressed);
-    sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (macOS standard dictation trigger)
+    // Dedicated Voice Dictation without interfering with third-party app shortcuts:
+    // Only send the dedicated vendor channel ACT10/11 + standard F19
+    sendStandardKeyboardKey(0x00, 0x6E, pressed); // F19 (safe function key)
 }
 
 void sendJoystickEvent(float angle, float distance) {
