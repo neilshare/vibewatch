@@ -722,15 +722,11 @@ void sendActionEvent(int index, bool pressed) {
 
 void sendMicEvent(bool pressed) {
     if (pressed) {
-        // PTT Start (Hold down): sends ACT10 + Doubao Voice Hotkey (Option+Space) + F19
+        // PTT Start (Hold down): sends ACT10 event
         sendActionEvent(10, true);
-        sendStandardKeyboardKey(0x04, 0x2C, true); // Option + Space (Doubao voice typing)
-        sendStandardKeyboardKey(0x00, 0x6E, true); // F19 (macOS Dictation fallback)
     } else {
-        // PTT End (Release): sends ACT11 + Key Up
+        // PTT End (Release): sends ACT11 event
         sendActionEvent(11, true);
-        sendStandardKeyboardKey(0x04, 0x2C, false); // Release Option + Space
-        sendStandardKeyboardKey(0x00, 0x6E, false); // Release F19
     }
 }
 

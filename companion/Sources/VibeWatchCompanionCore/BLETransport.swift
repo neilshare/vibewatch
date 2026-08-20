@@ -695,14 +695,48 @@ private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeri
         if key.starts(with: "AG") && pressed {
             progress(">>> [SLOT KEY \(key)] Card: \(card) -> Activating \(targetApp)...")
             activateApp(targetApp)
+            if let num = Int(key.dropFirst(2)), num >= 1 && num <= 6 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    self.sendKeyStroke(keyCode: 0x12 + UInt16(num - 1), modifiers: .maskCommand) // Cmd + 1..6
+                }
+            }
         } else if key == "ACT10" { // PTT Start
-            progress(">>> [PTT START] Activating \(targetApp) & Triggering Doubao Voice Input...")
+            progress(">>> [PTT START] Activating \(targetApp) Prompt & Triggering Doubao Voice Input...")
             activateApp(targetApp)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                // 1. Focus the prompt in Antigravity / Workbuddy (Cmd + L)
+                self.sendKeyStroke(keyCode: 0x25, modifiers: .maskCommand) // Cmd + L
+
+                // 2. Trigger voice dictation (Hold down Control for Doubao IME, and F19 for Dictation)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    self.postKeyEvent(virtualKey: 0x3B, keyDown: true) // Control Down
+                    self.postKeyEvent(virtualKey: 0x50, keyDown: true) // F19 Down
+                }
+            }
         } else if key == "ACT11" { // PTT End
-            progress(">>> [PTT END] Voice input finished into \(targetApp) Prompt.")
+            progress(">>> [PTT END] Finished voice input -> Text ready in \(targetApp) Prompt.")
+            postKeyEvent(virtualKey: 0x3B, keyDown: false) // Control Up
+            postKeyEvent(virtualKey: 0x50, keyDown: false) // F19 Up
         } else if key == "ACT07" || key == "ACT08" {
             let decision = (key == "ACT07") ? "APPROVE (OK)" : "REJECT (NG)"
             progress(">>> [HARDWARE APPROVAL] Decision: \(decision) for \(card)")
+        }
+    }
+
+    private func sendKeyStroke(keyCode: UInt16, modifiers: CGEventFlags = []) {
+        if let eventDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+           let eventUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
+            eventDown.flags = modifiers
+            eventUp.flags = modifiers
+            eventDown.post(tap: .cghidEventTap)
+            usleep(25000)
+            eventUp.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func postKeyEvent(virtualKey: UInt16, keyDown: Bool) {
+        if let event = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: keyDown) {
+            event.post(tap: .cghidEventTap)
         }
     }
 
