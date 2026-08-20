@@ -610,6 +610,7 @@ void sendFramedJson(String payload, bool appendCrlf,
 
 void sendStandardKeyboardKey(uint8_t modifiers, uint8_t keycode, bool pressed) {
     if (!g_connected || g_keyboardInput == nullptr) {
+        Serial.printf("KB dropped: connected=%d input=%p\n", g_connected, g_keyboardInput);
         return;
     }
     uint8_t report[8] = {};
@@ -618,11 +619,13 @@ void sendStandardKeyboardKey(uint8_t modifiers, uint8_t keycode, bool pressed) {
         report[2] = keycode;
     }
     g_keyboardInput->setValue(report, sizeof(report));
-    g_keyboardInput->notify();
+    bool ok = g_keyboardInput->notify();
+    Serial.printf("KB mod=0x%02X key=0x%02X pressed=%d notify=%d [%s]\n",
+                  modifiers, keycode, pressed, ok ? 1 : 0, g_cards[g_currentCard].name);
 }
 
 void sendKeyEvent(const char* key, bool pressed) {
-    if (!g_connected || g_vendorInput == nullptr) {
+    if (!g_connected) {
         return;
     }
 
@@ -637,11 +640,20 @@ void sendKeyEvent(const char* key, bool pressed) {
         return;
     }
     report[1] = static_cast<std::uint8_t>(written);
-    g_vendorInput->setValue(report, sizeof(report));
-    if (!g_vendorInput->notify()) {
-        Serial.printf("HID notify failed: %s\n", key);
-        return;
+
+    // 1. Notify on HID Vendor Report 6 (for native Codex client)
+    if (g_vendorInput != nullptr) {
+        g_vendorInput->setValue(report, sizeof(report));
+        g_vendorInput->notify();
     }
+
+    // 2. Also notify on Custom GATT Service (7f0d4e66-2ac2-4a71-bfbe-4ef61a0e5c04)
+    // macOS CoreBluetooth permits user-space daemon (Python/Bleak) to subscribe without restriction!
+    if (g_approvalResult != nullptr) {
+        g_approvalResult->setValue(reinterpret_cast<const uint8_t*>(&report[2]), written);
+        g_approvalResult->notify();
+    }
+
     Serial.printf("HID %s %s [%s] len=%d\n", key, pressed ? "DOWN" : "UP", g_cards[g_currentCard].name, written);
 }
 
@@ -660,7 +672,7 @@ void sendConsumerKey(uint16_t keycode, bool pressed) {
 
 void sendStandardKeyboardStroke(uint8_t modifiers, uint8_t keycode) {
     sendStandardKeyboardKey(modifiers, keycode, true);
-    delay(30);
+    delay(35);
     sendStandardKeyboardKey(modifiers, keycode, false);
 }
 
@@ -669,14 +681,13 @@ void sendAgentEvent(int index, bool pressed) {
     std::snprintf(key, sizeof(key), "AG%02d", index + 1); // 1-indexed: AG01..AG06 for Codex and agents
     sendKeyEvent(key, pressed);
 
-    // Option A: Switch Sidebar Conversation / Session List 1..6
-    // - Workbuddy & AntiGravity: Cmd + Option + 1..6 (0x0C = Left GUI + Left Option, 0x1E..0x23 = '1'..'6')
-    //   Directly targets sidebar conversation sessions without polluting input boxes or editor panes.
+    // Option A: Switch Conversation / Session / Tab 1..6
+    // - Workbuddy & AntiGravity: Cmd + 1..6 (0x08 = Left GUI / Command, 0x1E..0x23 = '1'..'6')
     // - Codex: Function keys F13..F18 (0x68..0x6D)
     if (index >= 0 && index < 6) {
         if (g_currentCard == CARD_WORKBUDDY || g_currentCard == CARD_ANTIGRAVITY) {
             if (pressed) {
-                sendStandardKeyboardStroke(0x0C, 0x1E + index); // Cmd + Option + 1..6 (Sidebar Session Switch)
+                sendStandardKeyboardStroke(0x08, 0x1E + index); // Cmd + 1..6 (Session / Tab switch)
             }
         } else {
             sendStandardKeyboardKey(0x00, 0x68 + index, pressed); // F13..F18
@@ -711,13 +722,15 @@ void sendActionEvent(int index, bool pressed) {
 
 void sendMicEvent(bool pressed) {
     if (pressed) {
-        // PTT Start (Hold down): sends ACT10 + F19 Key Down
+        // PTT Start (Hold down): sends ACT10 + Doubao Voice Hotkey (Option+Space) + F19
         sendActionEvent(10, true);
-        sendStandardKeyboardKey(0x00, 0x6E, true); // F19 (macOS Dictation)
+        sendStandardKeyboardKey(0x04, 0x2C, true); // Option + Space (Doubao voice typing)
+        sendStandardKeyboardKey(0x00, 0x6E, true); // F19 (macOS Dictation fallback)
     } else {
-        // PTT End (Release): sends ACT11 + F19 Key Up
+        // PTT End (Release): sends ACT11 + Key Up
         sendActionEvent(11, true);
-        sendStandardKeyboardKey(0x00, 0x6E, false); // F19 Key Up
+        sendStandardKeyboardKey(0x04, 0x2C, false); // Release Option + Space
+        sendStandardKeyboardKey(0x00, 0x6E, false); // Release F19
     }
 }
 

@@ -125,20 +125,20 @@ class VibeWatchBridge:
         decision = "APPROVE (OK)" if "07" in key or "OK" in key else "REJECT (NG)"
         logger.info(">>> [APPROVAL] User decided on watch: %s for %s", decision, card)
 
-    def on_hid_notification(self, sender: int, data: bytearray):
-        """Parse Vendor Report 6 JSON-RPC events from watch."""
+    def on_hid_notification(self, sender: Any, data: bytearray):
+        """Parse Vendor Report 6 and Custom GATT JSON-RPC events from watch."""
         try:
-            # Report 6: [channel(1), length(1), ...json payload...]
-            if len(data) < 3:
-                return
-            channel = data[0]
-            length = data[1]
-            payload_bytes = data[2:2 + length]
-            text = payload_bytes.decode("utf-8", errors="ignore").strip()
-            if not text:
+            raw_text = data.decode("utf-8", errors="ignore").strip()
+            # If starts with binary channel header [channel, length, ...]:
+            if not raw_text.startswith("{") and len(data) >= 3:
+                length = data[1]
+                payload_bytes = data[2:2 + length]
+                raw_text = payload_bytes.decode("utf-8", errors="ignore").strip()
+
+            if not raw_text.startswith("{"):
                 return
 
-            msg = json.loads(text)
+            msg = json.loads(raw_text)
             method = msg.get("m")
             params = msg.get("p", {})
 
@@ -157,7 +157,7 @@ class VibeWatchBridge:
                 else:
                     logger.info("HID Event: %s act=%d card=%s", key, act, card)
         except Exception as e:
-            logger.debug("Error parsing HID report: %s (raw=%s)", e, data.hex())
+            logger.debug("Error parsing notification: %s (raw=%s)", e, data.hex())
 
     async def run(self):
         logger.info("Scanning for VibeWatch / Codex Watch BLE peripheral...")
@@ -180,10 +180,11 @@ class VibeWatchBridge:
             self.client = client
             logger.info("Connected to VibeWatch! Subscribing to Vendor HID event stream...")
 
-            # Find Vendor Report (0x2A4D with length 63 or report 6)
+            # Subscribe to all notification/indication streams (including Custom GATT & HID)
             for service in client.services:
                 for char in service.characteristics:
-                    if "notify" in char.properties:
+                    props = char.properties
+                    if "notify" in props or "indicate" in props:
                         try:
                             await client.start_notify(char.uuid, self.on_hid_notification)
                             logger.info("Subscribed to characteristic: %s (%s)", char.uuid, char.description)
