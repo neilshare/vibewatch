@@ -160,25 +160,61 @@ class VibeWatchBridge:
             logger.debug("Error parsing notification: %s (raw=%s)", e, data.hex())
 
     async def run(self):
-        logger.info("Scanning for VibeWatch / Codex Watch BLE peripheral...")
+        logger.info("Scanning for VibeWatch / StopWatch BLE peripheral...")
         device = None
-        if self.device_id:
-            device = await BleakScanner.find_device_by_address(self.device_id, timeout=10.0)
-        else:
-            devices = await BleakScanner.discover(timeout=5.0)
-            for d in devices:
-                if d.name and ("Vibe" in d.name or "Codex" in d.name or "StopWatch" in d.name):
+
+        # 1. Try explicit device_id or cached config
+        target_uuid = self.device_id
+        config = {}
+        if CONFIG_FILE.is_file():
+            try:
+                config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if not target_uuid:
+                    target_uuid = config.get("device_id") or config.get("deviceId")
+            except Exception:
+                pass
+
+        if target_uuid:
+            try:
+                logger.info("Checking target device UUID: %s", target_uuid)
+                device = await BleakScanner.find_device_by_address(target_uuid, timeout=4.0)
+            except Exception as e:
+                logger.debug("Address lookup failed: %s", e)
+
+        # 2. General scan matching name / service UUIDs
+        if not device:
+            logger.info("Performing BLE discovery scan...")
+            devices = await BleakScanner.discover(timeout=5.0, return_adv=True)
+            for d, adv in devices.values():
+                name = (d.name or adv.local_name or "").lower()
+                service_uuids = [str(u).lower() for u in adv.service_uuids]
+                if (
+                    "vibe" in name
+                    or "watch" in name
+                    or "codex" in name
+                    or "stopwatch" in name
+                    or QUOTA_SERVICE_UUID.lower() in service_uuids
+                ):
+                    # Filter out Apple Watch if it has Apple Continuity
+                    if "neil watch" in name and "vibe" not in name:
+                        continue
                     device = d
+                    logger.info("Discovered matching device: %s (%s)", d.name or adv.local_name, d.address)
                     break
 
         if not device:
-            logger.error("VibeWatch peripheral not found. Please ensure it is powered on and in range.")
+            logger.error("VibeWatch peripheral not found. Please wake the watch screen and ensure Bluetooth is ON.")
             return
+
+        # Save to config for fast reconnect
+        config["device_id"] = device.address
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
         logger.info("Connecting to VibeWatch at %s (%s)...", device.address, device.name or "Unknown")
         async with BleakClient(device) as client:
             self.client = client
-            logger.info("Connected to VibeWatch! Subscribing to Vendor HID event stream...")
+            logger.info("Connected to VibeWatch! Subscribing to Vendor HID and Custom GATT event streams...")
 
             # Subscribe to all notification/indication streams (including Custom GATT & HID)
             for service in client.services:
