@@ -8,6 +8,7 @@ public protocol BLETransporting: AnyObject {
     func discoverDemoDevices() throws -> [UUID]
     func writeLegacyApproval(_ request: ApprovalRequestV2, deviceID: UUID) throws
     func enterBootloader(deviceID: UUID) throws
+    func runBridge(deviceID: UUID?, defaultCard: AgentCard) throws
 }
 
 public extension BLETransporting {
@@ -21,6 +22,10 @@ public extension BLETransporting {
 
     func enterBootloader(deviceID: UUID) throws {
         throw BLETransportError.transport("Bootloader entry is not supported by this transport.")
+    }
+
+    func runBridge(deviceID: UUID?, defaultCard: AgentCard) throws {
+        throw BLETransportError.transport("Bridge mode is not supported by this transport.")
     }
 }
 
@@ -170,6 +175,15 @@ public final class BLETransport: BLETransporting {
             verbose: verbose,
             progress: progress
         ).execute(timeout: 40)
+    }
+
+    public func runBridge(deviceID: UUID?, defaultCard: AgentCard) throws {
+        try BridgeBLESession(
+            targetDeviceID: deviceID,
+            defaultCard: defaultCard,
+            verbose: verbose,
+            progress: progress
+        ).run()
     }
 
     private static var encoder: JSONEncoder {
@@ -505,6 +519,18 @@ private final class DemoDiscoverySession: NSObject, CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             if verbose { progress("Demo discovery is scanning broadly by service/name.") }
+            let connected = central.retrieveConnectedPeripherals(withServices: [
+                BLETransport.serviceUUID,
+                CBUUID(string: "1812"),
+                CBUUID(string: "180F")
+            ])
+            for p in connected {
+                let name = p.name ?? ""
+                if name.starts(with: "Vibe Watch") || name.starts(with: "StopWatch") || name == "Codex Micro" {
+                    identifiers.insert(p.identifier)
+                    if verbose { progress("Found already-connected device \(name) [\(p.identifier.uuidString)]") }
+                }
+            }
             central.scanForPeripherals(withServices: nil)
         case .unauthorized:
             failure = BLETransportError.transport("Bluetooth access is not authorized.")
@@ -533,5 +559,161 @@ private final class DemoDiscoverySession: NSObject, CBCentralManagerDelegate {
                 || name == "Codex Micro" else { return }
         identifiers.insert(peripheral.identifier)
         if verbose { progress("Demo found \(name.isEmpty ? "unnamed device" : name) RSSI=\(RSSI).") }
+    }
+}
+
+import AppKit
+
+private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private let targetDeviceID: UUID?
+    private let defaultCard: AgentCard
+    private let verbose: Bool
+    private let progress: (String) -> Void
+
+    private var central: CBCentralManager!
+    private var peripheral: CBPeripheral?
+    private var isRunning = true
+
+    init(targetDeviceID: UUID?, defaultCard: AgentCard, verbose: Bool, progress: @escaping (String) -> Void) {
+        self.targetDeviceID = targetDeviceID
+        self.defaultCard = defaultCard
+        self.verbose = verbose
+        self.progress = progress
+        super.init()
+    }
+
+    func run() throws {
+        central = CBCentralManager(delegate: self, queue: nil)
+        progress("VibeWatch Native macOS Bridge is running. Listening for events...")
+        while isRunning {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+        }
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard central.state == .poweredOn else { return }
+        progress("Bluetooth is powered on. Discovering VibeWatch...")
+
+        // 1. Check connected devices first
+        let connected = central.retrieveConnectedPeripherals(withServices: [
+            BLETransport.serviceUUID,
+            CBUUID(string: "1812"),
+            CBUUID(string: "180F")
+        ])
+        for p in connected {
+            let name = p.name ?? ""
+            if let target = targetDeviceID, p.identifier == target {
+                connect(p)
+                return
+            } else if targetDeviceID == nil && (name.starts(with: "Vibe Watch") || name.starts(with: "StopWatch") || name == "Codex Micro") {
+                connect(p)
+                return
+            }
+        }
+
+        // 2. Scan if not found in connected list
+        central.scanForPeripherals(withServices: nil)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
+        if let target = targetDeviceID, peripheral.identifier == target {
+            central.stopScan()
+            connect(peripheral)
+        } else if targetDeviceID == nil && (name.starts(with: "Vibe Watch") || name.starts(with: "StopWatch") || name == "Codex Micro") {
+            central.stopScan()
+            connect(peripheral)
+        }
+    }
+
+    private func connect(_ p: CBPeripheral) {
+        self.peripheral = p
+        p.delegate = self
+        progress("Connecting to \(p.name ?? "Device") [\(p.identifier.uuidString)]...")
+        if p.state == .connected {
+            p.discoverServices([BLETransport.serviceUUID])
+        } else {
+            central.connect(p, options: nil)
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        progress("Connected to VibeWatch! Discovering private GATT services...")
+        peripheral.discoverServices([BLETransport.serviceUUID])
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        progress("VibeWatch disconnected. Waiting for reconnect...")
+        central.scanForPeripherals(withServices: nil)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let services = peripheral.services else { return }
+        for s in services where s.uuid == BLETransport.serviceUUID {
+            peripheral.discoverCharacteristics([BLETransport.approvalResultUUID], for: s)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard let characteristics = service.characteristics else { return }
+        for c in characteristics where c.uuid == BLETransport.approvalResultUUID {
+            peripheral.setNotifyValue(true, for: c)
+            progress("Subscribed to VibeWatch hardware event stream! Ready for PTT & Keys.")
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == BLETransport.approvalResultUUID, let data = characteristic.value else { return }
+        guard let text = String(data: data, encoding: .utf8) else { return }
+
+        // Parse JSON event: {"m":"v.oai.hid","p":{"k":"AG01","act":1,"c":"ANTIGRAVITY"}}
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let params = json["p"] as? [String: Any],
+              let key = params["k"] as? String else {
+            if verbose { progress("Raw event: \(text)") }
+            return
+        }
+
+        let act = (params["act"] as? Int) ?? 0
+        let card = (params["c"] as? String) ?? defaultCard.rawValue
+        let pressed = (act == 1)
+
+        handleHardwareEvent(key: key, act: act, card: card, pressed: pressed)
+    }
+
+    private func handleHardwareEvent(key: String, act: Int, card: String, pressed: Bool) {
+        let cardUpper = card.uppercased()
+        let targetApp: String
+        if cardUpper.contains("ANTI") || cardUpper.contains("GRAVITY") {
+            targetApp = "Antigravity"
+        } else if cardUpper.contains("BUDDY") {
+            targetApp = "Workbuddy"
+        } else {
+            targetApp = "ChatGPT"
+        }
+
+        if key.starts(with: "AG") && pressed {
+            progress(">>> [SLOT KEY \(key)] Card: \(card) -> Activating \(targetApp)...")
+            activateApp(targetApp)
+        } else if key == "ACT10" { // PTT Start
+            progress(">>> [PTT START] Activating \(targetApp) & Triggering Doubao Voice Input...")
+            activateApp(targetApp)
+        } else if key == "ACT11" { // PTT End
+            progress(">>> [PTT END] Voice input finished into \(targetApp) Prompt.")
+        } else if key == "ACT07" || key == "ACT08" {
+            let decision = (key == "ACT07") ? "APPROVE (OK)" : "REJECT (NG)"
+            progress(">>> [HARDWARE APPROVAL] Decision: \(decision) for \(card)")
+        }
+    }
+
+    private func activateApp(_ name: String) {
+        DispatchQueue.main.async {
+            for app in NSWorkspace.shared.runningApplications {
+                if let appName = app.localizedName, appName.localizedCaseInsensitiveContains(name) {
+                    app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+                    return
+                }
+            }
+        }
     }
 }

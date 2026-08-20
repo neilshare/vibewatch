@@ -138,6 +138,10 @@ public final class Runner: CommandRunner {
             let client = try appServerFactory(options.codexPath)
             return try runQuotaLoop(client: client, options: options, emit: emit)
 
+        case .bridge(let defaultCard):
+            try transport.runBridge(deviceID: options.deviceIdentifier, defaultCard: defaultCard)
+            return CommandResult()
+
         case .jsonOnly:
             var snapshot = try appServerFactory(options.codexPath).readRateLimits()
             applyOverrides(to: &snapshot, options: options)

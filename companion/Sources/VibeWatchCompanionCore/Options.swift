@@ -22,6 +22,7 @@ public enum CompanionMode: Equatable, Sendable {
     case manualQuota(QuotaSnapshot)
     case demo(QuotaSnapshot)
     case jsonOnly
+    case bridge(AgentCard)
 }
 
 public struct CompanionOptions: Equatable, Sendable {
@@ -48,6 +49,7 @@ public struct CompanionOptions: Equatable, Sendable {
         var jsonOnly = false
         var approval = false
         var bootloader = false
+        var bridge = false
         var watch = false
         var interval: TimeInterval = 60
         var verbose = false
@@ -81,6 +83,7 @@ public struct CompanionOptions: Equatable, Sendable {
             case "--json-only": jsonOnly = true; explicitModes += 1
             case "--approval": approval = true; explicitModes += 1
             case "--enter-bootloader": bootloader = true; explicitModes += 1
+            case "--bridge": bridge = true; explicitModes += 1
             case "--remaining":
                 let raw = try nextValue(argument)
                 guard let value = Double(raw), value.isFinite, (0...100).contains(value) else {
@@ -161,6 +164,8 @@ public struct CompanionOptions: Equatable, Sendable {
         } else if bootloader {
             guard deviceIdentifier != nil else { throw CompanionError.usage("--enter-bootloader requires --device-id") }
             mode = .enterBootloader
+        } else if bridge {
+            mode = .bridge(card ?? .antigravity)
         } else if demo {
             mode = .demo(QuotaSnapshot(
                 remainingPercent: (card == .workbuddy || credits != nil) ? 85 : 59,
