@@ -563,6 +563,7 @@ private final class DemoDiscoverySession: NSObject, CBCentralManagerDelegate {
 }
 
 import AppKit
+import Carbon
 
 private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private let targetDeviceID: UUID?
@@ -682,27 +683,18 @@ private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeri
     }
 
     private func handleHardwareEvent(key: String, act: Int, card: String, pressed: Bool) {
-        let cardUpper = card.uppercased()
-        let targetApp: String
-        if cardUpper.contains("ANTI") || cardUpper.contains("GRAVITY") {
-            targetApp = "Antigravity"
-        } else if cardUpper.contains("BUDDY") {
-            targetApp = "Workbuddy"
-        } else {
-            targetApp = "ChatGPT"
-        }
-
         if key.starts(with: "AG") && pressed {
-            progress(">>> [SLOT KEY \(key)] Card: \(card) -> Activating \(targetApp)...")
-            activateApp(targetApp)
+            progress(">>> [SLOT KEY \(key)] Card: \(card) -> Activating target application...")
+            activateTargetApp(card)
             if let num = Int(key.dropFirst(2)), num >= 1 && num <= 6 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     self.sendKeyStroke(keyCode: 0x12 + UInt16(num - 1), modifiers: .maskCommand) // Cmd + 1..6
                 }
             }
         } else if key == "ACT10" { // PTT Start
-            progress(">>> [PTT START] Activating \(targetApp) Prompt & Triggering Doubao Voice Input...")
-            activateApp(targetApp)
+            progress(">>> [PTT START] Activating \(card) -> Switching to Doubao IME -> Focusing Prompt...")
+            activateTargetApp(card)
+            switchToDoubaoIME()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                 // 1. Focus the prompt in Antigravity / Workbuddy (Cmd + L)
                 self.sendKeyStroke(keyCode: 0x25, modifiers: .maskCommand) // Cmd + L
@@ -714,12 +706,25 @@ private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeri
                 }
             }
         } else if key == "ACT11" { // PTT End
-            progress(">>> [PTT END] Finished voice input -> Text ready in \(targetApp) Prompt.")
+            progress(">>> [PTT END] Finished voice input -> Text ready in \(card) Prompt.")
             postKeyEvent(virtualKey: 0x3B, keyDown: false) // Control Up
             postKeyEvent(virtualKey: 0x50, keyDown: false) // F19 Up
         } else if key == "ACT07" || key == "ACT08" {
             let decision = (key == "ACT07") ? "APPROVE (OK)" : "REJECT (NG)"
             progress(">>> [HARDWARE APPROVAL] Decision: \(decision) for \(card)")
+        }
+    }
+
+    private func switchToDoubaoIME() {
+        let list = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
+        for s in list {
+            if let ptr = TISGetInputSourceProperty(s, kTISPropertyInputSourceID) {
+                let id = Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+                if id.contains("doubaoime") {
+                    TISSelectInputSource(s)
+                    return
+                }
+            }
         }
     }
 
@@ -740,12 +745,31 @@ private final class BridgeBLESession: NSObject, CBCentralManagerDelegate, CBPeri
         }
     }
 
-    private func activateApp(_ name: String) {
+    private func activateTargetApp(_ card: String) {
+        let cardUpper = card.uppercased()
+        let bundleIDs: [String]
+
+        if cardUpper.contains("ANTI") || cardUpper.contains("GRAVITY") {
+            bundleIDs = ["com.google.antigravity", "com.google.antigravity-ide"]
+        } else if cardUpper.contains("BUDDY") {
+            bundleIDs = ["com.workbuddy.workbuddy"]
+        } else {
+            bundleIDs = ["com.openai.codex"]
+        }
+
         DispatchQueue.main.async {
-            for app in NSWorkspace.shared.runningApplications {
-                if let appName = app.localizedName, appName.localizedCaseInsensitiveContains(name) {
+            for bid in bundleIDs {
+                let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+                if let app = apps.first(where: { !$0.isTerminated }) {
                     app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
                     return
+                }
+            }
+            if let firstID = bundleIDs.first {
+                let script = "tell application id \"\(firstID)\" to activate"
+                if let appleScript = NSAppleScript(source: script) {
+                    var err: NSDictionary?
+                    appleScript.executeAndReturnError(&err)
                 }
             }
         }
