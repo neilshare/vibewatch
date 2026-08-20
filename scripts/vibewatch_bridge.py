@@ -19,10 +19,18 @@ import sys
 import time
 from typing import Any
 
-import bleak
-from bleak import BleakClient, BleakScanner
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+try:
+    import bleak
+    from bleak import BleakClient, BleakScanner
+except ImportError:
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if venv_python.is_file() and sys.executable != str(venv_python):
+        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    else:
+        sys.stderr.write("Error: 'bleak' is required. Please run: pip3 install bleak or use .venv/bin/python\n")
+        sys.exit(1)
 CONFIG_FILE = Path.home() / ".vibewatch" / "config.json"
 
 # BLE UUIDs
